@@ -15,4 +15,5 @@ Login → EXPORTAÇÃO ▸ Registros Individuais → ficha + ano → Gerar Arqui
 Consultar Exportações DBF → aguarda "Concluído" → baixa e extrai o .dbf.
 
 ## Uso
+Baixe o `.exe` em **Releases** (baixa o Chromium na 1ª execução) ou rode do código:
 `setup` e depois `run`. Credenciais na GUI (salvas em `.env`).

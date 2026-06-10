@@ -24,3 +24,9 @@ venv/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# PyInstaller build output (the exe is published via GitHub Releases, not committed)
+build/
+dist/
+*.zip
+bot-sivep-gripe-data/

@@ -33,7 +33,26 @@ TIPO_FICHA_LABELS = ALLOWED_TIPOS
 
 
 def project_dir() -> Path:
-    """Project root = the folder this file lives in."""
+    """Directory for user data (downloads, .env, session, browsers, logs).
+
+    - Running from source: the folder this file lives in.
+    - Frozen (PyInstaller .exe): a stable per-user folder next to the .exe if writable,
+      otherwise %LOCALAPPDATA%\\bot-sivep-gripe. Never the temp _MEIPASS extraction dir.
+    """
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        # Prefer a 'data' folder beside the exe; fall back to LOCALAPPDATA if read-only.
+        candidate = exe_dir / "bot-sivep-gripe-data"
+        try:
+            candidate.mkdir(exist_ok=True)
+            test = candidate / ".write_test"
+            test.write_text("ok", encoding="utf-8")
+            test.unlink()
+            return candidate
+        except Exception:
+            appdata = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "bot-sivep-gripe"
+            appdata.mkdir(parents=True, exist_ok=True)
+            return appdata
     return Path(__file__).resolve().parent
 
 
@@ -69,6 +88,38 @@ def _paths(base: Path | None = None) -> dict[str, Path]:
     for key in ("downloads", "state", "logs"):
         paths[key].mkdir(exist_ok=True)
     return paths
+
+
+def ensure_chromium(browsers_dir: Path, log=print) -> None:
+    """Make sure Playwright's Chromium is available in `browsers_dir`.
+
+    Points PLAYWRIGHT_BROWSERS_PATH at the folder and, if no Chromium build is found
+    there, downloads it via `playwright install chromium`. This is what lets the .exe
+    fetch the browser on first run instead of bundling ~150MB into the executable.
+    """
+    browsers_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_dir)
+
+    if any(browsers_dir.glob("chromium-*")) or any(
+        browsers_dir.glob("chromium_headless_shell-*")
+    ):
+        return  # already installed
+
+    log("Chromium não encontrado — baixando (primeira execução, requer internet)…")
+    import subprocess
+
+    env = dict(os.environ, PLAYWRIGHT_BROWSERS_PATH=str(browsers_dir))
+    # When frozen, call the bundled Playwright CLI through this same executable.
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    else:
+        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Falha ao baixar o Chromium:\n" + (proc.stderr or proc.stdout or "")[-1500:]
+        )
+    log("Chromium instalado com sucesso.")
 
 
 # --------------------------------------------------------------------------- #
@@ -240,8 +291,8 @@ async def run_exports(
         )
 
     paths = _paths(base_dir)
-    if paths["browsers"].exists():
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(paths["browsers"])
+    # Ensure Chromium is present (downloads on first run if missing).
+    ensure_chromium(paths["browsers"], log=log)
 
     login, senha = load_credentials(paths["project"])
     if not (login and senha):
