@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# Build/chat history (contains plaintext credentials; not for publishing)
+CHAT_HISTORY.md
+
+# Saved browser session (cookies / login state)
+state/
+
+# Downloaded reports
+downloads/
+
+# Run logs
+logs/
+
+# Virtual environment (machine-local, rebuilt by setup.sh / setup.ps1)
+venv/
+
+# Playwright browser binaries: large AND per-OS. A single folder can't hold both
+# Windows and Linux builds, so these are re-installed per machine, not shipped.
+.playwright-browsers/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
