@@ -1,0 +1,79 @@
+id: sivep-daily-to-sheets
+namespace: saude.sivep
+
+# Baixa diariamente a exportação DBF da última semana (SRAG Hospitalizado) do
+# SIVEP-Gripe e anexa as linhas novas a uma planilha Google.
+
+triggers:
+  - id: daily
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 * * *"          # todo dia às 06:00
+
+tasks:
+  # ── 1. Solicita a exportação (última semana) ─────────────────────────
+  - id: gerar
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: mcr.microsoft.com/playwright/python:v1.60.0-jammy
+    namespaceFiles:
+      enabled: true            # sobe sivep_core.py + kestra/*.py do namespace
+    env:
+      SIVEP_LOGIN: "{{ secret('SIVEP_LOGIN') }}"
+      SIVEP_SENHA: "{{ secret('SIVEP_SENHA') }}"
+      ANO: "{{ now() | date('yyyy') }}"
+      TIPO: "3"                # 3 = SRAG Hospitalizado (1 = SG)
+    commands:
+      - python kestra/kestra_gerar.py
+    # imprime ::{"outputs":{"solicitacao":"<num>"}}::
+
+  # ── 2. Espera inicial antes da 1ª tentativa de download ──────────────
+  - id: espera_inicial
+    type: io.kestra.plugin.core.flow.Sleep
+    duration: PT5M
+
+  # ── 3. Download: checa uma vez; se não pronto, Kestra re-tenta 5/10/20 ─
+  - id: baixar
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: mcr.microsoft.com/playwright/python:v1.60.0-jammy
+    namespaceFiles:
+      enabled: true
+    env:
+      SIVEP_LOGIN: "{{ secret('SIVEP_LOGIN') }}"
+      SIVEP_SENHA: "{{ secret('SIVEP_SENHA') }}"
+      SOLICITACAO: "{{ outputs.gerar.vars.solicitacao }}"
+    outputFiles:
+      - "*.dbf"
+    commands:
+      - python kestra/kestra_baixar.py    # sai != 0 se ainda não estiver pronto
+    retry:
+      type: custom
+      # escada de espera: 5 min, depois 10, depois 20
+      intervals:
+        - PT5M
+        - PT10M
+        - PT20M
+      # fallback portável caso sua versão do Kestra não aceite 'intervals':
+      #   type: exponential
+      #   interval: PT5M
+      #   maxInterval: PT20M
+      #   maxAttempt: 4
+
+  # ── 4. DBF -> dedup (NU_NOTIFIC) -> anexa no Google Sheets ───────────
+  - id: para_sheets
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    namespaceFiles:
+      enabled: true
+    env:
+      GOOGLE_SERVICE_ACCOUNT: "{{ secret('GOOGLE_SERVICE_ACCOUNT') }}"
+      SHEET_ID: "{{ secret('SHEET_ID') }}"
+      SHEET_TAB: "dados"
+      DBF_FILE: "{{ outputs.baixar.outputFiles['*.dbf'] }}"
+    beforeCommands:
+      - pip install --quiet gspread dbfread pandas
+    commands:
+      - python kestra/kestra_sheets.py
+
+errors:
+  - id: alerta
+    type: io.kestra.plugin.core.log.Log
+    message: "Falha no sivep-daily-to-sheets — export não ficou pronto a tempo ou erro no upload."

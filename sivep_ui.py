@@ -84,6 +84,36 @@ class RunWorker(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class FaixaWorker(QThread):
+    """Background worker for the 'Distribuição por faixa etária' Excel export."""
+
+    message = Signal(str)
+    finished_ok = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, units, headless):
+        super().__init__()
+        self._units = units
+        self._headless = headless
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            files = sivep_core.run_faixa_etaria_sync(
+                units=self._units,
+                headless=self._headless,
+                slow_mo_ms=0 if self._headless else 200,
+                log=self.message.emit,
+                should_cancel=lambda: self._cancel,
+            )
+            self.finished_ok.emit([str(f) for f in files])
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 # --------------------------------------------------------------------------- #
 # DBF table model.
 # --------------------------------------------------------------------------- #
@@ -370,6 +400,96 @@ class ViewerTab(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+# Faixa Etária tab — Distribuição dos vírus respiratórios por faixa etária.
+# --------------------------------------------------------------------------- #
+
+class FaixaEtariaTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._worker: FaixaWorker | None = None
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Exporta para Excel a 'Distribuição dos vírus respiratórios por faixa etária'\n"
+            "(todos os vírus, IFI+PCR, faixas 0-1/2-4/5-14/15-49/50-64/65+, última semana),\n"
+            "uma exportação por ficha (SG e SRAG UTI) para cada unidade selecionada."
+        )
+        layout.addWidget(info)
+
+        box = QGroupBox("Unidades (US)")
+        box_l = QHBoxLayout(box)
+        # One checkbox per unit defined in core (US 165 is absent there by design).
+        self._unit_checks = {}
+        for us in sivep_core.UNIDADES_US:
+            cb = QCheckBox(f"US {us}")
+            cb.setChecked(True)
+            self._unit_checks[us] = cb
+            box_l.addWidget(cb)
+        box_l.addStretch()
+        layout.addWidget(box)
+
+        opts = QHBoxLayout()
+        self.chk_headless = QCheckBox("Navegador invisível (headless)")
+        opts.addWidget(self.chk_headless)
+        opts.addStretch()
+        layout.addLayout(opts)
+
+        btns = QHBoxLayout()
+        self.btn_run = QPushButton("▶ Exportar Excel")
+        self.btn_run.clicked.connect(self._start)
+        self.btn_stop = QPushButton("■ Parar")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop)
+        btns.addWidget(self.btn_run)
+        btns.addWidget(self.btn_stop)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        layout.addWidget(QLabel("Log:"))
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        layout.addWidget(self.log, 1)
+
+    def _start(self):
+        login, senha = sivep_core.load_credentials()
+        if not (login and senha):
+            QMessageBox.warning(
+                self, "Credenciais", "Informe login e senha na aba Runner primeiro."
+            )
+            return
+        units = [us for us, cb in self._unit_checks.items() if cb.isChecked()]
+        if not units:
+            QMessageBox.warning(self, "Unidades", "Selecione ao menos uma unidade.")
+            return
+        self.log.clear()
+        self._set_running(True)
+        self._worker = FaixaWorker(units, headless=self.chk_headless.isChecked())
+        self._worker.message.connect(self.log.appendPlainText)
+        self._worker.finished_ok.connect(self._done)
+        self._worker.failed.connect(self._error)
+        self._worker.start()
+
+    def _stop(self):
+        if self._worker:
+            self.log.appendPlainText(">> Parando após a etapa atual…")
+            self._worker.cancel()
+            self.btn_stop.setEnabled(False)
+
+    def _done(self, files):
+        self._set_running(False)
+        self.log.appendPlainText(f">> Concluído. {len(files)} arquivo(s) Excel salvo(s).")
+
+    def _error(self, msg):
+        self._set_running(False)
+        self.log.appendPlainText(f">> ERRO: {msg}")
+        QMessageBox.critical(self, "Erro na execução", msg)
+
+    def _set_running(self, running):
+        self.btn_run.setEnabled(not running)
+        self.btn_stop.setEnabled(running)
+
+
+# --------------------------------------------------------------------------- #
 # Main window.
 # --------------------------------------------------------------------------- #
 
@@ -382,7 +502,9 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         self.viewer = ViewerTab()
         self.runner = RunnerTab(on_run_finished=self.viewer.refresh_list)
+        self.faixa = FaixaEtariaTab()
         tabs.addTab(self.runner, "Runner")
+        tabs.addTab(self.faixa, "Faixa Etária")
         tabs.addTab(self.viewer, "DBF Viewer")
         self.setCentralWidget(tabs)
 

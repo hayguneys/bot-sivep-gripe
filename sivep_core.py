@@ -488,6 +488,271 @@ def run_exports_sync(*args, **kwargs) -> list[Path]:
     return asyncio.run(run_exports(*args, **kwargs))
 
 
+# --------------------------------------------------------------------------- #
+# Relatório: Distribuição dos vírus respiratórios por Faixa Etária.
+# RELATÓRIOS -> EPIDEMIOLÓGICOS -> DISTRIBUIÇÃO DOS VÍRUS RESPIRATÓRIOS POR FAIXA ETÁRIA
+# Exports the on-screen HTML table to Excel, looping over municipal units.
+# --------------------------------------------------------------------------- #
+
+# Unidades Sentinela: "US" number -> <select> value (confirmed live for this account).
+# US 165 is intentionally absent (not selectable for this login).
+UNIDADES_US = {
+    "153": "628",
+    "159": "1077",
+    "163": "11768",
+    "164": "562",
+    "167": "1320",
+    "169": "564",
+}
+
+# Tipo de ficha options on THIS report (different from the DBF export form).
+FAIXA_TIPOS_FICHA = {"1": "SG", "2": "SRAG_UTI"}
+
+# Custom age ranges to define (Definir Faixas Etárias): (inicial, final); "" = open-ended.
+FAIXAS_ETARIAS = [("0", "1"), ("2", "4"), ("5", "14"), ("15", "49"), ("50", "64"), ("65", "")]
+
+
+async def _faixa_open_form(page, log=print):
+    """Navigate RELATÓRIOS -> EPIDEMIOLÓGICOS -> ...POR FAIXA ETÁRIA (hover menus, click)."""
+    await page.goto(PRINCIPAL_URL, wait_until="networkidle")
+    await _settle(page)
+    await page.locator("a.sf-with-ul[alt*='RELAT']").first.hover()
+    await page.wait_for_timeout(800)
+    epi = page.locator("a.sf-with-ul[alt*='EPIDEMIOL']").first
+    if await epi.count():
+        await epi.hover()
+        await page.wait_for_timeout(800)
+    # The menu link's accent makes text matching brittle; match by JS regex.
+    await page.evaluate(
+        """() => {
+            const a = [...document.querySelectorAll('a')]
+                .find(e => /RESPIRAT.*FAIXA ET/i.test(e.textContent));
+            if (a) a.click();
+        }"""
+    )
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(2500)
+    await _settle(page)
+
+
+def _current_epi_week(today=None) -> tuple[str, str]:
+    """Return (ano, semana) for the current Brazilian epidemiological week (SE).
+
+    SE follows the MMWR/CDC convention: weeks start on Sunday; SE 1 is the week
+    containing the first Sunday-based week with >=4 days in January (i.e. the week
+    containing Jan 4). Returns strings.
+    """
+    from datetime import date, timedelta
+
+    d = today or date.today()
+    # Sunday that starts d's epi week (weekday(): Mon=0..Sun=6 -> days since Sunday).
+    week_start = d - timedelta(days=(d.weekday() + 1) % 7)
+    # Epi year is the year of the Thursday in that week (mid-week rule).
+    thursday = week_start + timedelta(days=4)
+    epi_year = thursday.year
+    # Week 1 = the epi week whose Sunday-start contains Jan 4 of the epi year.
+    def week1(yr):
+        j4 = date(yr, 1, 4)
+        return j4 - timedelta(days=(j4.weekday() + 1) % 7)
+
+    se = (week_start - week1(epi_year)).days // 7 + 1
+    if se < 1:  # belongs to the last week of the previous epi year
+        epi_year -= 1
+        se = (week_start - week1(epi_year)).days // 7 + 1
+    return str(epi_year), str(se)
+
+
+async def _faixa_move_all(page, choices_name, values=None):
+    """Select option(s) in a dual-list 'choices' select and click its Adicionar (>) button."""
+    choices = page.locator(f"select[name='{choices_name}']")
+    if values is None:
+        values = await choices.locator("option").evaluate_all("els => els.map(o => o.value)")
+    await choices.select_option(values)
+    await page.evaluate(
+        """(name) => {
+            const sel = document.querySelector(`select[name='${name}']`);
+            const scope = sel.closest('tr') || sel.parentElement.parentElement;
+            for (const b of scope.querySelectorAll("button,input[type=button],a,img")) {
+                const t = (b.textContent || b.value || b.alt || b.title || '').trim();
+                if (t === '>' || /adicion/i.test(t)) { b.click(); return; }
+            }
+            const btns = scope.querySelectorAll("button,input[type=button]");
+            if (btns.length) btns[0].click();
+        }""",
+        choices_name,
+    )
+    await page.wait_for_timeout(700)
+
+
+async def _faixa_set_unidade(page, value):
+    """Set the Chosen.js-backed unidade select by value and fire its change AJAX."""
+    await page.evaluate(
+        """(val) => {
+            const s = document.querySelector('#unidadeSentinela');
+            s.value = val;
+            s.dispatchEvent(new Event('change', {bubbles:true}));
+            if (window.jQuery) jQuery(s).trigger('chosen:updated').trigger('change');
+        }""",
+        value,
+    )
+
+
+async def _faixa_definir_faixas(page, faixas, log=print):
+    """Check 'Definir Faixas Etárias' (Wicket AJAX) and add each custom age range."""
+    # Target by stable NAME — the id (e.g. id1e) is dynamic and changes per render.
+    # The checkbox fires a Wicket AJAX that reveals campoInicial/Final. Click and wait
+    # for that reveal; retry the click once if the fields don't appear (AJAX race).
+    field = "[name='faixasEtarias:campoInicial']"
+    for attempt in range(3):
+        if await page.locator(field).is_visible():
+            break
+        # Use a native JS click — Playwright's .click() gets swallowed by the Wicket
+        # AJAX re-render of the checkbox, so the reveal never fires.
+        await page.evaluate(
+            "() => document.querySelector"
+            "(\"[name='faixasEtarias:checkFaixasEtarias']\").click()"
+        )
+        await page.wait_for_timeout(2800)
+        await _settle(page)
+        log(f"Faixas: aguardando campos (tentativa {attempt + 1}).")
+    await page.wait_for_selector(field, state="visible", timeout=6000)
+    for ini, fim in faixas:
+        await page.fill("[name='faixasEtarias:campoInicial']", ini)
+        await page.fill("[name='faixasEtarias:campoFinal']", fim)
+        # Click the faixas add control: button.botaoAdicionar, whose onclick is
+        # Wicket.FaixasEtarias.add('campoInicial','campoFinal',...).
+        await page.click("button.botaoAdicionar")
+        await page.wait_for_timeout(700)
+    n = await page.locator("[name='faixasEtarias:listSelection'] option").count()
+    log(f"Faixas etárias definidas: {n}")
+
+
+async def run_faixa_etaria(
+    *,
+    units=None,
+    headless: bool = True,
+    slow_mo_ms: int = 0,
+    log=print,
+    base_dir: Path | None = None,
+    should_cancel=None,
+) -> list[Path]:
+    """Export the 'Distribuição dos vírus por faixa etária' table to Excel.
+
+    For each municipal unit and each ficha type (SG, SRAG UTI), fills the form for the
+    latest epidemiological week, selects all vírus + IFI/PCR + the custom age ranges,
+    clicks Consultar, exports the table to Excel, then Voltar. Returns saved .xls paths.
+    """
+    units = units or list(UNIDADES_US.keys())
+    paths = _paths(base_dir)
+    ensure_chromium(paths["browsers"], log=log)
+    login, senha = load_credentials(paths["project"])
+    if not (login and senha):
+        raise RuntimeError("Missing credentials (set them in the GUI / .env).")
+
+    def _cancelled():
+        return bool(should_cancel and should_cancel())
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved: list[Path] = []
+
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
+    context = await browser.new_context(accept_downloads=True)
+    page = await context.new_page()
+    try:
+        # Login.
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+        if "login.html" in page.url:
+            await page.fill("input[name='email']", login)
+            await page.fill("input[name='senha']", senha)
+            await page.click("input[type='submit'][name='ENTRAR']")
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(2000)
+            if "login.html" in page.url:
+                raise RuntimeError("Login falhou — confira as credenciais.")
+        await _settle(page)
+        log(f"Login OK -> {page.url}")
+
+        for us in units:
+            if _cancelled():
+                log("Cancelado pelo usuário.")
+                break
+            value = UNIDADES_US.get(us)
+            if not value:
+                log(f"US {us} não está na lista desta conta — pulando.")
+                continue
+
+            for tipo_val, tipo_nome in FAIXA_TIPOS_FICHA.items():
+                if _cancelled():
+                    break
+                log(f"===== US {us} | {tipo_nome} =====")
+                await _faixa_open_form(page, log)
+
+                # Select the unidade first (its AJAX may populate the period defaults).
+                await _faixa_set_unidade(page, value)
+                await page.wait_for_timeout(1500)
+                await _settle(page)
+
+                # Period = current epidemiological week (Ano is required; fill it BEFORE
+                # the faixas checkbox, whose Wicket AJAX validates the form).
+                ano, sem = _current_epi_week()
+                await page.fill("[name='periodo:ano']", ano)
+                await page.fill("[name='periodo:semanaInicial']", sem)
+                await page.fill("[name='periodo:semanaFinal']", sem)
+                # Nudge Wicket to register the values (blur via Tab).
+                await page.locator("[name='periodo:semanaFinal']").press("Tab")
+                await page.wait_for_timeout(800)
+                log(f"Período: ano {ano}, semana epidemiológica {sem}")
+
+                await _faixa_move_all(page, "listaContainerTipoFicha:choices", [tipo_val])
+                await _faixa_move_all(page, "listaContainerTipoExame:choices", ["1", "2"])
+                await _faixa_move_all(page, "listaContainerTipoVirusRespiratorio:choices", None)
+                await _faixa_definir_faixas(page, FAIXAS_ETARIAS, log)
+
+                await page.click("input#consultar")
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(3000)
+                await _settle(page)
+
+                btn = page.locator("input#exportarExcel, input[name='exportarExcel']").first
+                if not await btn.count():
+                    log(f"US {us} {tipo_nome}: sem resultado / botão Excel ausente — pulando.")
+                    continue
+                async with page.expect_download(timeout=120000) as info:
+                    await btn.click()
+                dl = await info.value
+                target = paths["downloads"] / (
+                    f"faixaetaria_US{us}_{tipo_nome}_{ano}_se{sem}_{run_id}_{dl.suggested_filename}"
+                )
+                await dl.save_as(str(target))
+                saved.append(target)
+                log(f"Excel salvo -> {target}")
+
+                # Voltar to the form for the next iteration.
+                voltar = page.locator("input#voltar, input[name='voltar']").first
+                if await voltar.count():
+                    await voltar.click()
+                    await page.wait_for_load_state("networkidle")
+                    await _settle(page)
+    finally:
+        await context.close()
+        await browser.close()
+        await pw.stop()
+
+    log("===== FAIXA ETÁRIA: concluído =====")
+    for f in saved:
+        log(f"  salvo: {f}")
+    return saved
+
+
+def run_faixa_etaria_sync(*args, **kwargs) -> list[Path]:
+    """Blocking wrapper around :func:`run_faixa_etaria` (UI thread / CLI)."""
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    return asyncio.run(run_faixa_etaria(*args, **kwargs))
+
+
 if __name__ == "__main__":
     # Minimal CLI: python sivep_core.py 2024 3,1
     import argparse
