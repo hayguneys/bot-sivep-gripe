@@ -409,9 +409,12 @@ class FaixaEtariaTab(QWidget):
         self._worker: FaixaWorker | None = None
         layout = QVBoxLayout(self)
 
+        faixas_str = ", ".join(
+            f"{ini}-{fim if fim else '+'}" for ini, fim in sivep_core.FAIXAS_ETARIAS
+        )
         info = QLabel(
             "Exporta para Excel a 'Distribuição dos vírus respiratórios por faixa etária'\n"
-            "(todos os vírus, IFI+PCR, faixas 0-1/2-4/5-14/15-49/50-64/65+, última semana),\n"
+            f"(todos os vírus, IFI+PCR, faixas {faixas_str}, última semana),\n"
             "uma exportação por ficha (SG e SRAG UTI) para cada unidade selecionada."
         )
         layout.addWidget(info)

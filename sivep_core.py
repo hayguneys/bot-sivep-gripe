@@ -616,15 +616,21 @@ async def _faixa_definir_faixas(page, faixas, log=print):
         await _settle(page)
         log(f"Faixas: aguardando campos (tentativa {attempt + 1}).")
     await page.wait_for_selector(field, state="visible", timeout=6000)
-    for ini, fim in faixas:
+    for idx, (ini, fim) in enumerate(faixas, 1):
         await page.fill("[name='faixasEtarias:campoInicial']", ini)
         await page.fill("[name='faixasEtarias:campoFinal']", fim)
         # Click the faixas add control: button.botaoAdicionar, whose onclick is
         # Wicket.FaixasEtarias.add('campoInicial','campoFinal',...).
         await page.click("button.botaoAdicionar")
         await page.wait_for_timeout(700)
-    n = await page.locator("[name='faixasEtarias:listSelection'] option").count()
-    log(f"Faixas etárias definidas: {n}")
+        count = await page.locator("[name='faixasEtarias:listSelection'] option").count()
+        fim_label = f"{fim}+" if fim == "" else fim
+        log(f"Faixa {idx}: {ini}-{fim_label} → adicionada ({count} total)")
+    final_count = await page.locator("[name='faixasEtarias:listSelection'] option").count()
+    if final_count != len(faixas):
+        log(f"AVISO: esperadas {len(faixas)} faixas, mas {final_count} estão na lista")
+    else:
+        log(f"✓ Faixas etárias definidas: {final_count}/{len(faixas)}")
 
 
 async def run_faixa_etaria(
