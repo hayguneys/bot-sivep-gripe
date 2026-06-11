@@ -1,8 +1,11 @@
 id: sivep-daily-to-sheets
 namespace: saude.sivep
 
-# Baixa diariamente a exportação DBF da última semana (SRAG Hospitalizado) do
-# SIVEP-Gripe e anexa as linhas novas a uma planilha Google.
+# Pipeline diário:
+# 1. Baixa SG (tipo 1) e SRAG Hospitalizado (tipo 3) do SIVEP
+# 2. Anexa linhas novas ao Google Sheets (abas: SG, SRAG)
+# 3. Gera faixa etária (distribuição por idade) em Excel
+# 4. Processa e anexa ao Google Sheets (abas: SG-agregados, SRAG-agregados)
 
 triggers:
   - id: daily
@@ -10,28 +13,12 @@ triggers:
     cron: "0 6 * * *"          # todo dia às 06:00
 
 tasks:
-  # ── 1. Solicita a exportação (última semana) ─────────────────────────
-  - id: gerar
-    type: io.kestra.plugin.scripts.python.Commands
-    containerImage: mcr.microsoft.com/playwright/python:v1.60.0-jammy
-    namespaceFiles:
-      enabled: true            # sobe sivep_core.py + kestra/*.py do namespace
-    env:
-      SIVEP_LOGIN: "{{ secret('SIVEP_LOGIN') }}"
-      SIVEP_SENHA: "{{ secret('SIVEP_SENHA') }}"
-      ANO: "{{ now() | date('yyyy') }}"
-      TIPO: "3"                # 3 = SRAG Hospitalizado (1 = SG)
-    commands:
-      - python kestra/kestra_gerar.py
-    # imprime ::{"outputs":{"solicitacao":"<num>"}}::
+  # ═══════════════════════════════════════════════════════════════════════
+  # SEÇÃO 1: SG (REGISTROS INDIVIDUAIS)
+  # ═══════════════════════════════════════════════════════════════════════
 
-  # ── 2. Espera inicial antes da 1ª tentativa de download ──────────────
-  - id: espera_inicial
-    type: io.kestra.plugin.core.flow.Sleep
-    duration: PT5M
-
-  # ── 3. Download: checa uma vez; se não pronto, Kestra re-tenta 5/10/20 ─
-  - id: baixar
+  # ── 1a. Solicita exportação SG (última semana) ────────────────────────
+  - id: gerar_sg
     type: io.kestra.plugin.scripts.python.Commands
     containerImage: mcr.microsoft.com/playwright/python:v1.60.0-jammy
     namespaceFiles:
@@ -39,26 +26,43 @@ tasks:
     env:
       SIVEP_LOGIN: "{{ secret('SIVEP_LOGIN') }}"
       SIVEP_SENHA: "{{ secret('SIVEP_SENHA') }}"
-      SOLICITACAO: "{{ outputs.gerar.vars.solicitacao }}"
+      ANO: "{{ now() | date('yyyy') }}"
+      TIPO: "1"                # 1 = SG
+    commands:
+      - python kestra/kestra_gerar.py
+
+  # ── 1b. Espera inicial ────────────────────────────────────────────────
+  - id: espera_sg
+    type: io.kestra.plugin.core.flow.Sleep
+    duration: PT5M
+    dependsOn:
+      - gerar_sg
+
+  # ── 1c. Download SG com retry ─────────────────────────────────────────
+  - id: baixar_sg
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: mcr.microsoft.com/playwright/python:v1.60.0-jammy
+    namespaceFiles:
+      enabled: true
+    env:
+      SIVEP_LOGIN: "{{ secret('SIVEP_LOGIN') }}"
+      SIVEP_SENHA: "{{ secret('SIVEP_SENHA') }}"
+      SOLICITACAO: "{{ outputs.gerar_sg.vars.solicitacao }}"
     outputFiles:
       - "*.dbf"
     commands:
-      - python kestra/kestra_baixar.py    # sai != 0 se ainda não estiver pronto
+      - python kestra/kestra_baixar.py
     retry:
       type: custom
-      # escada de espera: 5 min, depois 10, depois 20
       intervals:
         - PT5M
         - PT10M
         - PT20M
-      # fallback portável caso sua versão do Kestra não aceite 'intervals':
-      #   type: exponential
-      #   interval: PT5M
-      #   maxInterval: PT20M
-      #   maxAttempt: 4
+    dependsOn:
+      - espera_sg
 
-  # ── 4. DBF -> dedup (NU_NOTIFIC) -> anexa no Google Sheets ───────────
-  - id: para_sheets
+  # ── 1d. SG -> Google Sheets (aba SG) ─────────────────────────────────
+  - id: sheets_sg
     type: io.kestra.plugin.scripts.python.Commands
     containerImage: ghcr.io/kestra-io/pydata:latest
     namespaceFiles:
@@ -66,14 +70,139 @@ tasks:
     env:
       GOOGLE_SERVICE_ACCOUNT: "{{ secret('GOOGLE_SERVICE_ACCOUNT') }}"
       SHEET_ID: "{{ secret('SHEET_ID') }}"
-      SHEET_TAB: "dados"
-      DBF_FILE: "{{ outputs.baixar.outputFiles['*.dbf'] }}"
+      SHEET_TAB: "SG"
+      DBF_FILE: "{{ outputs.baixar_sg.outputFiles['*.dbf'] }}"
     beforeCommands:
       - pip install --quiet gspread dbfread pandas
     commands:
       - python kestra/kestra_sheets.py
+    dependsOn:
+      - baixar_sg
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # SEÇÃO 2: SRAG HOSPITALIZADO
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── 2a. Solicita exportação SRAG ──────────────────────────────────────
+  - id: gerar_srag
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: mcr.microsoft.com/playwright/python:v1.60.0-jammy
+    namespaceFiles:
+      enabled: true
+    env:
+      SIVEP_LOGIN: "{{ secret('SIVEP_LOGIN') }}"
+      SIVEP_SENHA: "{{ secret('SIVEP_SENHA') }}"
+      ANO: "{{ now() | date('yyyy') }}"
+      TIPO: "3"                # 3 = SRAG Hospitalizado
+    commands:
+      - python kestra/kestra_gerar.py
+
+  # ── 2b. Espera inicial ────────────────────────────────────────────────
+  - id: espera_srag
+    type: io.kestra.plugin.core.flow.Sleep
+    duration: PT5M
+    dependsOn:
+      - gerar_srag
+
+  # ── 2c. Download SRAG com retry ───────────────────────────────────────
+  - id: baixar_srag
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: mcr.microsoft.com/playwright/python:v1.60.0-jammy
+    namespaceFiles:
+      enabled: true
+    env:
+      SIVEP_LOGIN: "{{ secret('SIVEP_LOGIN') }}"
+      SIVEP_SENHA: "{{ secret('SIVEP_SENHA') }}"
+      SOLICITACAO: "{{ outputs.gerar_srag.vars.solicitacao }}"
+    outputFiles:
+      - "*.dbf"
+    commands:
+      - python kestra/kestra_baixar.py
+    retry:
+      type: custom
+      intervals:
+        - PT5M
+        - PT10M
+        - PT20M
+    dependsOn:
+      - espera_srag
+
+  # ── 2d. SRAG -> Google Sheets (aba SRAG) ────────────────────────────
+  - id: sheets_srag
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    namespaceFiles:
+      enabled: true
+    env:
+      GOOGLE_SERVICE_ACCOUNT: "{{ secret('GOOGLE_SERVICE_ACCOUNT') }}"
+      SHEET_ID: "{{ secret('SHEET_ID') }}"
+      SHEET_TAB: "SRAG"
+      DBF_FILE: "{{ outputs.baixar_srag.outputFiles['*.dbf'] }}"
+    beforeCommands:
+      - pip install --quiet gspread dbfread pandas
+    commands:
+      - python kestra/kestra_sheets.py
+    dependsOn:
+      - baixar_srag
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # SEÇÃO 3: FAIXA ETÁRIA (AGREGADOS) — SG + SRAG
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── 3a. Gera faixa etária em Excel ────────────────────────────────────
+  - id: gerar_faixa
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: mcr.microsoft.com/playwright/python:v1.60.0-jammy
+    namespaceFiles:
+      enabled: true
+    env:
+      SIVEP_LOGIN: "{{ secret('SIVEP_LOGIN') }}"
+      SIVEP_SENHA: "{{ secret('SIVEP_SENHA') }}"
+    outputFiles:
+      - "downloads/faixaetaria*.xls"
+    commands:
+      - python kestra/kestra_faixa.py
+    dependsOn:
+      - sheets_sg
+      - sheets_srag
+
+  # ── 3b. Faixa SG -> Google Sheets (aba SG-agregados) ──────────────────
+  - id: sheets_faixa_sg
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    namespaceFiles:
+      enabled: true
+    env:
+      GOOGLE_SERVICE_ACCOUNT: "{{ secret('GOOGLE_SERVICE_ACCOUNT') }}"
+      SHEET_ID: "{{ secret('SHEET_ID') }}"
+      SHEET_TAB: "SG-agregados"
+      FAIXA_PATTERN: "SG_"
+    beforeCommands:
+      - pip install --quiet gspread openpyxl pandas
+    commands:
+      - python kestra/kestra_faixa_sheets.py
+    dependsOn:
+      - gerar_faixa
+
+  # ── 3c. Faixa SRAG -> Google Sheets (aba SRAG-agregados) ──────────────
+  - id: sheets_faixa_srag
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    namespaceFiles:
+      enabled: true
+    env:
+      GOOGLE_SERVICE_ACCOUNT: "{{ secret('GOOGLE_SERVICE_ACCOUNT') }}"
+      SHEET_ID: "{{ secret('SHEET_ID') }}"
+      SHEET_TAB: "SRAG-agregados"
+      FAIXA_PATTERN: "SRAG_UTI_"
+    beforeCommands:
+      - pip install --quiet gspread openpyxl pandas
+    commands:
+      - python kestra/kestra_faixa_sheets.py
+    dependsOn:
+      - gerar_faixa
 
 errors:
   - id: alerta
     type: io.kestra.plugin.core.log.Log
-    message: "Falha no sivep-daily-to-sheets — export não ficou pronto a tempo ou erro no upload."
+    message: "Falha na pipeline sivep-daily-to-sheets — verifique logs acima."
