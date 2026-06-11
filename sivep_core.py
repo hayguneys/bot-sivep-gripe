@@ -90,34 +90,54 @@ def _paths(base: Path | None = None) -> dict[str, Path]:
     return paths
 
 
+def _chromium_present(browsers_dir: Path) -> bool:
+    """True only if a chromium-* build with a real chrome.exe/chrome binary exists."""
+    for d in browsers_dir.glob("chromium-*"):
+        if (d / "chrome-win64" / "chrome.exe").exists() or (
+            d / "chrome-linux" / "chrome"
+        ).exists():
+            return True
+    return False
+
+
 def ensure_chromium(browsers_dir: Path, log=print) -> None:
     """Make sure Playwright's Chromium is available in `browsers_dir`.
 
-    Points PLAYWRIGHT_BROWSERS_PATH at the folder and, if no Chromium build is found
-    there, downloads it via `playwright install chromium`. This is what lets the .exe
-    fetch the browser on first run instead of bundling ~150MB into the executable.
+    Points PLAYWRIGHT_BROWSERS_PATH at the folder and, if no usable Chromium build is
+    found, downloads it. This is what lets the .exe fetch the browser on first run
+    instead of bundling ~150MB into the executable.
+
+    Crucially this must work when FROZEN (PyInstaller). A frozen exe cannot run
+    `python -m playwright install` (sys.executable is the GUI exe, not Python), so we
+    call Playwright's driver install routine directly via its Python API.
     """
     browsers_dir.mkdir(parents=True, exist_ok=True)
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_dir)
 
-    if any(browsers_dir.glob("chromium-*")) or any(
-        browsers_dir.glob("chromium_headless_shell-*")
-    ):
+    if _chromium_present(browsers_dir):
         return  # already installed
 
     log("Chromium não encontrado — baixando (primeira execução, requer internet)…")
-    import subprocess
 
-    env = dict(os.environ, PLAYWRIGHT_BROWSERS_PATH=str(browsers_dir))
-    # When frozen, call the bundled Playwright CLI through this same executable.
-    if getattr(sys, "frozen", False):
-        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+    # Use Playwright's driver directly. compute_driver_executable() returns the path to
+    # the bundled Node driver + its main.js, which works both from source and frozen.
+    import subprocess
+    from playwright._impl._driver import compute_driver_executable, get_driver_env
+
+    driver = compute_driver_executable()
+    # Newer Playwright returns a (node_exe, cli_js) tuple; older returns a single path.
+    if isinstance(driver, (tuple, list)):
+        cmd = [str(driver[0]), str(driver[1]), "install", "chromium"]
     else:
-        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+        cmd = [str(driver), "install", "chromium"]
+
+    env = get_driver_env()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_dir)
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if proc.returncode != 0:
+    if proc.returncode != 0 or not _chromium_present(browsers_dir):
         raise RuntimeError(
-            "Falha ao baixar o Chromium:\n" + (proc.stderr or proc.stdout or "")[-1500:]
+            "Falha ao baixar o Chromium:\n"
+            + (proc.stderr or proc.stdout or "sem saída")[-1500:]
         )
     log("Chromium instalado com sucesso.")
 
