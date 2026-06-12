@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -61,9 +62,13 @@ def run_exports(tipo: str, tipo_nome: str):
     print(f"{'='*70}")
 
     try:
+        # Mirror the Kestra flow: current year, latest epidemiological week only.
+        ano = str(datetime.now().year)
         files = sivep_core.run_exports_sync(
-            tipos_ficha={tipo: tipo_nome},
+            ano,
+            {tipo: tipo_nome},
             headless=True,
+            somente_ultima_semana=True,
             log=print,
         )
         if files:

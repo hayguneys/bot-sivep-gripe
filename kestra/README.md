@@ -10,6 +10,8 @@ _sivep_kestra.py     helpers (login, gerar, baixar) sobre sivep_core
 kestra_gerar.py      task 1: solicita export -> imprime nº da solicitação
 kestra_baixar.py     task 2: checa 1x; baixa+extrai se pronto; senão sai !=0 (retry)
 kestra_sheets.py     task 3: DBF -> dedup por NU_NOTIFIC -> append no Sheets
+kestra_faixa.py      task 4: gera Excel de faixa etária (agregados SG + SRAG_UTI)
+kestra_faixa_sheets.py  task 5: Excel faixa etária -> append nas abas *-agregados
 ```
 
 ## Fluxo
