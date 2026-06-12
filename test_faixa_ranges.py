@@ -33,7 +33,7 @@ if __name__ == "__main__":
     print("FAIXA ETÁRIA AGE RANGE SUBMISSION TEST")
     print("=" * 70)
     print(f"\nConfiguration:")
-    print(f"  Units to test: US 165 (just one for speed)")
+    print(f"  Units to test: US 153 (just one for speed)")
     print(f"  Browser: VISIBLE (headless=False)")
     print(f"  Speed: SLOW (slow_mo=500ms) so you can observe button clicks")
     print(f"  Log level: DETAILED (per-range logging enabled)")
@@ -47,7 +47,7 @@ if __name__ == "__main__":
 
     try:
         files = sivep_core.run_faixa_etaria_sync(
-            units=["165"],  # Just one unit for faster test
+            units=["153"],  # Just one unit for faster test (165 is not selectable)
             headless=False,  # VISIBLE browser
             slow_mo_ms=500,  # Slow motion to observe clicks
             log=log_with_timestamp,

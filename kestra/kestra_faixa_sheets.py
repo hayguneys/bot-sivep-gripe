@@ -20,8 +20,21 @@ import sys
 from pathlib import Path
 
 import gspread
-import openpyxl
 import pandas as pd
+
+
+def read_excel_rows(path: Path) -> list[tuple]:
+    """Read the data rows (header skipped) of a SIVEP 'Excel' export.
+
+    The portal may serve real .xlsx, legacy binary .xls, or an HTML table with an
+    .xls filename — try pandas' Excel engines first, then fall back to read_html.
+    """
+    try:
+        df = pd.read_excel(path, header=0)
+    except Exception:
+        df = pd.read_html(path, header=0)[0]
+    df = df.where(pd.notna(df), None)  # NaN -> None so blank cells become ""
+    return [tuple(r) for r in df.itertuples(index=False, name=None)]
 
 
 def main() -> int:
@@ -34,13 +47,17 @@ def main() -> int:
         print("Erro: variáveis de ambiente obrigatórias não definidas.", file=sys.stderr)
         return 1
 
-    # Find Excel files in downloads/ matching the pattern
+    # Find Excel files in downloads/ matching the pattern (.xls or .xlsx)
     downloads_dir = Path(__file__).parent.parent / "downloads"
-    excel_files = list(downloads_dir.glob(f"faixaetaria*{pattern}*.xls"))
+    excel_files = list(downloads_dir.glob(f"faixaetaria*{pattern}*.xls*"))
 
     if not excel_files:
-        print(f"Nenhum arquivo encontrado em {downloads_dir} com padrão 'faixaetaria*{pattern}*.xls'")
-        return 0
+        print(
+            f"Nenhum arquivo encontrado em {downloads_dir} com padrão "
+            f"'faixaetaria*{pattern}*.xls*'",
+            file=sys.stderr,
+        )
+        return 1
 
     print(f"Encontrados {len(excel_files)} arquivo(s) com padrão '{pattern}'")
 
@@ -49,12 +66,7 @@ def main() -> int:
     for excel_file in excel_files:
         print(f"  Lendo {excel_file.name}...")
         try:
-            # openpyxl to skip header rows intelligently
-            wb = openpyxl.load_workbook(str(excel_file), data_only=True)
-            ws = wb.active
-            rows = list(ws.iter_rows(min_row=2, values_only=True))  # skip header
-            # Filter out None rows
-            rows = [r for r in rows if any(r)]
+            rows = [r for r in read_excel_rows(excel_file) if any(v is not None for v in r)]
             all_rows.extend(rows)
             print(f"    → {len(rows)} linhas")
         except Exception as e:

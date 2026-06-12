@@ -92,11 +92,15 @@ def _paths(base: Path | None = None) -> dict[str, Path]:
 
 def _chromium_present(browsers_dir: Path) -> bool:
     """True only if a chromium-* build with a real chrome.exe/chrome binary exists."""
+    # Folder layout varies by Playwright version/platform: chrome-linux or
+    # chrome-linux64 on Linux, chrome-win or chrome-win64 on Windows.
     for d in browsers_dir.glob("chromium-*"):
-        if (d / "chrome-win64" / "chrome.exe").exists() or (
-            d / "chrome-linux" / "chrome"
-        ).exists():
-            return True
+        for sub in ("chrome-linux", "chrome-linux64"):
+            if (d / sub / "chrome").exists():
+                return True
+        for sub in ("chrome-win", "chrome-win64"):
+            if (d / sub / "chrome.exe").exists():
+                return True
     return False
 
 
@@ -514,25 +518,35 @@ FAIXAS_ETARIAS = [("0", "1"), ("2", "4"), ("5", "14"), ("15", "49"), ("50", "64"
 
 async def _faixa_open_form(page, log=print):
     """Navigate RELATÓRIOS -> EPIDEMIOLÓGICOS -> ...POR FAIXA ETÁRIA (hover menus, click)."""
-    await page.goto(PRINCIPAL_URL, wait_until="networkidle")
-    await _settle(page)
-    await page.locator("a.sf-with-ul[alt*='RELAT']").first.hover()
-    await page.wait_for_timeout(800)
-    epi = page.locator("a.sf-with-ul[alt*='EPIDEMIOL']").first
-    if await epi.count():
-        await epi.hover()
+    for attempt in range(2):
+        await page.goto(PRINCIPAL_URL, wait_until="networkidle")
+        await _settle(page)
+        await page.locator("a.sf-with-ul[alt*='RELAT']").first.hover()
         await page.wait_for_timeout(800)
-    # The menu link's accent makes text matching brittle; match by JS regex.
-    await page.evaluate(
-        """() => {
-            const a = [...document.querySelectorAll('a')]
-                .find(e => /RESPIRAT.*FAIXA ET/i.test(e.textContent));
-            if (a) a.click();
-        }"""
-    )
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(2500)
-    await _settle(page)
+        epi = page.locator("a.sf-with-ul[alt*='EPIDEMIOL']").first
+        if await epi.count():
+            await epi.hover()
+            await page.wait_for_timeout(800)
+        # The menu link's accent makes text matching brittle; match by JS regex.
+        await page.evaluate(
+            """() => {
+                const a = [...document.querySelectorAll('a')]
+                    .find(e => /RESPIRAT.*FAIXA ET/i.test(e.textContent));
+                if (a) a.click();
+            }"""
+        )
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(2500)
+        await _settle(page)
+        # The form is only usable once the unidade select exists; retry the menu
+        # navigation once if it didn't land (hover menus are timing-sensitive).
+        # The select is Chosen.js-backed and therefore hidden — wait for attached.
+        try:
+            await page.wait_for_selector("#unidadeSentinela", state="attached", timeout=15000)
+            return
+        except Exception:
+            log(f"Formulário de faixa etária não carregou (tentativa {attempt + 1}).")
+    raise RuntimeError("Não foi possível abrir o formulário de faixa etária.")
 
 
 def _current_epi_week(today=None) -> tuple[str, str]:
@@ -619,9 +633,10 @@ async def _faixa_definir_faixas(page, faixas, log=print):
     for idx, (ini, fim) in enumerate(faixas, 1):
         await page.fill("[name='faixasEtarias:campoInicial']", ini)
         await page.fill("[name='faixasEtarias:campoFinal']", fim)
-        # Click the faixas add control: button.botaoAdicionar, whose onclick is
+        # Click the faixas add control. The page has several button.botaoAdicionar
+        # (one per dual-list); the faixas one is the button whose onclick calls
         # Wicket.FaixasEtarias.add('campoInicial','campoFinal',...).
-        await page.click("button.botaoAdicionar")
+        await page.click("button.botaoAdicionar[onclick*='FaixasEtarias.add']")
         await page.wait_for_timeout(700)
         count = await page.locator("[name='faixasEtarias:listSelection'] option").count()
         fim_label = f"{fim}+" if fim == "" else fim
@@ -723,13 +738,19 @@ async def run_faixa_etaria(
 
                 btn = page.locator("input#exportarExcel, input[name='exportarExcel']").first
                 if not await btn.count():
-                    log(f"US {us} {tipo_nome}: sem resultado / botão Excel ausente — pulando.")
+                    if await page.get_by_text("Não existem registros").count():
+                        log(f"US {us} {tipo_nome}: sem registros para o período — pulando.")
+                    else:
+                        log(f"US {us} {tipo_nome}: botão Excel ausente — pulando.")
                     continue
                 async with page.expect_download(timeout=120000) as info:
                     await btn.click()
                 dl = await info.value
+                # The portal's suggested filename is mangled (no extension); keep its
+                # extension when present, otherwise default to .xls (legacy Excel).
+                ext = Path(dl.suggested_filename or "").suffix or ".xls"
                 target = paths["downloads"] / (
-                    f"faixaetaria_US{us}_{tipo_nome}_{ano}_se{sem}_{run_id}_{dl.suggested_filename}"
+                    f"faixaetaria_US{us}_{tipo_nome}_{ano}_se{sem}_{run_id}{ext}"
                 )
                 await dl.save_as(str(target))
                 saved.append(target)

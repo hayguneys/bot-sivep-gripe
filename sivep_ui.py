@@ -12,6 +12,7 @@ Run it with run.sh (Linux/macOS) or run.ps1 (Windows), or:
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, Signal
@@ -174,7 +175,8 @@ class RunnerTab(QWidget):
 
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Ano epidemiológico:"))
-        self.ano = QLineEdit("2024")
+        # Default to the current year, matching the Kestra flow ({{ now() | date('yyyy') }}).
+        self.ano = QLineEdit(str(datetime.now().year))
         self.ano.setMaximumWidth(100)
         row1.addWidget(self.ano)
         row1.addStretch()
@@ -196,7 +198,8 @@ class RunnerTab(QWidget):
         self.chk_paciente = QCheckBox("Exportar dados do paciente")
         self.chk_paciente.setChecked(True)
         self.chk_ultima_semana = QCheckBox("Somente a última semana")
-        self.chk_ultima_semana.setChecked(False)
+        # Checked by default to match the daily Kestra pipeline; uncheck for full-year.
+        self.chk_ultima_semana.setChecked(True)
         self.chk_ultima_semana.setToolTip(
             "Exporta apenas a semana epidemiológica mais recente, em vez do ano inteiro."
         )

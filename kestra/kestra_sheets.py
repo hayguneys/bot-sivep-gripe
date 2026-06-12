@@ -14,6 +14,7 @@ Env in:
 import json
 import os
 import sys
+from pathlib import Path
 
 import gspread
 import pandas as pd
@@ -23,7 +24,16 @@ DEDUP_COL = "NU_NOTIFIC"
 
 
 def main() -> int:
-    dbf_file = os.environ["DBF_FILE"]
+    # DBF_FILE may be unset (files arrive via the task's inputFiles into the
+    # working dir) — fall back to the newest *.dbf found there.
+    dbf_file = os.environ.get("DBF_FILE", "")
+    if not (dbf_file and os.path.isfile(dbf_file)):
+        candidates = sorted(Path(".").rglob("*.dbf"), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            print("Nenhum .dbf encontrado no diretório de trabalho.", file=sys.stderr)
+            return 2
+        dbf_file = str(candidates[-1])
+    print(f"Lendo {dbf_file}")
     df = pd.DataFrame(iter(DBF(dbf_file, encoding="latin-1", char_decode_errors="replace")))
     if df.empty:
         print("DBF sem registros — nada a enviar.")
