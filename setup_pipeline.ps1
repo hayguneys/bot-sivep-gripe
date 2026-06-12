@@ -11,11 +11,11 @@ Write-Host "Installing Python packages..." -ForegroundColor Yellow
 pip install --quiet --upgrade pip
 
 $packages = @(
-    "gspread",      # Google Sheets API
-    "openpyxl",     # Excel reading
-    "pandas",       # Data processing
-    "dbfread",      # DBF reading
-    "python-dotenv" # .env file support
+    "gspread",
+    "openpyxl",
+    "pandas",
+    "dbfread",
+    "python-dotenv"
 )
 
 foreach ($pkg in $packages) {
