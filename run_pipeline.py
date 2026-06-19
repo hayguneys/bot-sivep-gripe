@@ -25,8 +25,16 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent / "kestra"))
 
 import sivep_core
+from kestra.kestra_faixa_sheets import push_faixa_to_sheets
+
+# Faixa etária tipo → (filename pattern, target Google Sheets tab).
+FAIXA_TABS = {
+    "SG": ("SG_", "SG-agregados"),
+    "SRAG": ("SRAG_UTI_", "SRAG-agregados"),
+}
 
 
 def load_env():
@@ -87,8 +95,12 @@ def run_exports(tipo: str, tipo_nome: str):
         return False
 
 
-def run_faixa():
-    """Generate faixa etária (age distribution) for SG and SRAG."""
+def run_faixa(creds):
+    """Generate faixa etária (age distribution) and push aggregates to Sheets.
+
+    Generates Excel for both SG and SRAG_UTI, then appends each ficha type's
+    rows to its dedicated tab (SG-agregados / SRAG-agregados).
+    """
     print(f"\n{'='*70}")
     print(f"▶ Gerando faixa etária (SG e SRAG)...")
     print(f"{'='*70}")
@@ -98,18 +110,34 @@ def run_faixa():
             headless=True,
             log=print,
         )
-        if files:
-            print(f"✓ Geração concluída: {len(files)} arquivo(s)")
-            # TODO: Import the kestra script and run it
-            return True
-        else:
+        if not files:
             print(f"⚠ Nenhum arquivo gerado")
             return False
+        print(f"✓ Geração concluída: {len(files)} arquivo(s)")
     except Exception as e:
-        print(f"❌ Erro: {e}")
+        print(f"❌ Erro na geração: {e}")
         import traceback
         traceback.print_exc()
         return False
+
+    # Push each ficha type's Excel into its aggregate tab.
+    ok = True
+    for label, (pattern, tab) in FAIXA_TABS.items():
+        print(f"\n  → Enviando {label} para aba '{tab}'...")
+        try:
+            push_faixa_to_sheets(
+                pattern=pattern,
+                sheet_tab=tab,
+                sheet_id=creds["sheet_id"],
+                service_account_json=creds["service_account"],
+                log=print,
+            )
+        except Exception as e:
+            print(f"  ❌ Erro ao enviar {label}: {e}")
+            import traceback
+            traceback.print_exc()
+            ok = False
+    return ok
 
 
 def main():
@@ -145,7 +173,7 @@ def main():
 
     if args.faixa_only:
         # Run faixa etária only
-        results["Faixa Etária"] = run_faixa()
+        results["Faixa Etária"] = run_faixa(creds)
     else:
         # Run SG and SRAG (unless skipped)
         if not args.srag_only:
@@ -155,7 +183,7 @@ def main():
 
         # Run faixa etária (unless skipped)
         if not args.no_faixa:
-            results["Faixa Etária"] = run_faixa()
+            results["Faixa Etária"] = run_faixa(creds)
 
     # Summary
     print(f"\n{'='*70}")

@@ -14,6 +14,19 @@ kestra_faixa.py      task 4: gera Excel de faixa etária (agregados SG + SRAG_UT
 kestra_faixa_sheets.py  task 5: Excel faixa etária -> append nas abas *-agregados
 ```
 
+## Abas do Google Sheets
+| Aba             | Conteúdo                                   | Dedup por                       |
+|-----------------|--------------------------------------------|---------------------------------|
+| `SG`            | registros individuais SG                   | `NU_NOTIFIC`                    |
+| `SRAG`          | registros individuais SRAG Hospitalizado   | `NU_NOTIFIC`                    |
+| `SG-agregados`  | distribuição por faixa etária (SG)         | US+Tipo+Ano+Semana+linha        |
+| `SRAG-agregados`| distribuição por faixa etária (SRAG_UTI)   | US+Tipo+Ano+Semana+linha        |
+
+As abas `*-agregados` recebem colunas de proveniência (`US`, `Tipo`, `Ano`,
+`Semana`, `Arquivo`) extraídas do nome do arquivo antes das colunas da tabela.
+A coluna `Arquivo` é só rastreio — fica **fora** da chave de dedup, então
+re-rodar a mesma US/semana não duplica linhas.
+
 ## Fluxo
 `gerar` (solicita) → `espera_inicial` 5min → `baixar` (retry 5→10→20) → `para_sheets`.
 Tentativas efetivas de download em ~5, 10, 20 e 40 min após a solicitação.
