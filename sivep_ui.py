@@ -92,10 +92,12 @@ class FaixaWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, units, headless):
+    def __init__(self, units, headless, start_year=None, end_year=None):
         super().__init__()
         self._units = units
         self._headless = headless
+        self._start_year = start_year
+        self._end_year = end_year
         self._cancel = False
 
     def cancel(self):
@@ -105,6 +107,8 @@ class FaixaWorker(QThread):
         try:
             files = sivep_core.run_faixa_etaria_sync(
                 units=self._units,
+                start_year=self._start_year,
+                end_year=self._end_year,
                 headless=self._headless,
                 slow_mo_ms=0 if self._headless else 200,
                 log=self.message.emit,
@@ -417,10 +421,31 @@ class FaixaEtariaTab(QWidget):
         )
         info = QLabel(
             "Exporta para Excel a 'Distribuição dos vírus respiratórios por faixa etária'\n"
-            f"(todos os vírus, IFI+PCR, faixas {faixas_str}, última semana),\n"
+            f"(todos os vírus, IFI+PCR, faixas {faixas_str}),\n"
+            "baixando cada Semana Epidemiológica do intervalo de anos selecionado,\n"
             "uma exportação por ficha (SG e SRAG UTI) para cada unidade selecionada."
         )
         layout.addWidget(info)
+
+        # Year interval: download every SE from each year in [inicial, final].
+        cur_year = int(sivep_core._current_epi_week()[0])
+        years = [str(y) for y in range(cur_year, 2008, -1)]  # current -> 2009
+        period_box = QGroupBox("Intervalo de anos (Semana Epidemiológica)")
+        period_l = QHBoxLayout(period_box)
+        period_l.addWidget(QLabel("Ano inicial:"))
+        self.cmb_start_year = QComboBox()
+        self.cmb_start_year.addItems(years)
+        period_l.addWidget(self.cmb_start_year)
+        period_l.addSpacing(20)
+        period_l.addWidget(QLabel("Ano final:"))
+        self.cmb_end_year = QComboBox()
+        self.cmb_end_year.addItems(years)
+        period_l.addWidget(self.cmb_end_year)
+        period_l.addStretch()
+        # Default both to the current epi year (downloads weeks 1..semana atual).
+        self.cmb_start_year.setCurrentText(str(cur_year))
+        self.cmb_end_year.setCurrentText(str(cur_year))
+        layout.addWidget(period_box)
 
         box = QGroupBox("Unidades (US)")
         box_l = QHBoxLayout(box)
@@ -467,9 +492,36 @@ class FaixaEtariaTab(QWidget):
         if not units:
             QMessageBox.warning(self, "Unidades", "Selecione ao menos uma unidade.")
             return
+
+        start_year = int(self.cmb_start_year.currentText())
+        end_year = int(self.cmb_end_year.currentText())
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
+
+        # Estimate the workload and confirm before a long multi-week run.
+        n_weeks = len(sivep_core._faixa_periods(start_year, end_year))
+        n_total = n_weeks * len(units) * len(sivep_core.FAIXA_TIPOS_FICHA)
+        resp = QMessageBox.question(
+            self,
+            "Confirmar download",
+            f"Período: {start_year}–{end_year} ({n_weeks} semana(s) epidemiológica(s)).\n"
+            f"Unidades: {len(units)} · Fichas: {len(sivep_core.FAIXA_TIPOS_FICHA)} (SG, SRAG UTI).\n\n"
+            f"Total estimado: {n_total} exportações Excel.\n"
+            "Isso pode demorar bastante. Deseja continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if resp != QMessageBox.Yes:
+            return
+
         self.log.clear()
         self._set_running(True)
-        self._worker = FaixaWorker(units, headless=self.chk_headless.isChecked())
+        self._worker = FaixaWorker(
+            units,
+            headless=self.chk_headless.isChecked(),
+            start_year=start_year,
+            end_year=end_year,
+        )
         self._worker.message.connect(self.log.appendPlainText)
         self._worker.finished_ok.connect(self._done)
         self._worker.failed.connect(self._error)

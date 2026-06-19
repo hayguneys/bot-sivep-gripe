@@ -576,6 +576,53 @@ def _current_epi_week(today=None) -> tuple[str, str]:
     return str(epi_year), str(se)
 
 
+def _weeks_in_epi_year(year: int) -> int:
+    """Number of epidemiological weeks (52 or 53) in the given epi year.
+
+    The count is the number of Sunday-based weeks between SE 1 of `year` and
+    SE 1 of `year + 1` (MMWR convention, week containing Jan 4).
+    """
+    from datetime import date, timedelta
+
+    def week1_start(yr):
+        j4 = date(yr, 1, 4)
+        return j4 - timedelta(days=(j4.weekday() + 1) % 7)
+
+    return (week1_start(year + 1) - week1_start(year)).days // 7
+
+
+def _faixa_periods(start_year=None, end_year=None) -> list[tuple[str, str]]:
+    """Build the list of (ano, semana) periods to fetch for faixa etária.
+
+    - No years given -> just the current epidemiological week (preserves the
+      daily/Kestra single-week behavior).
+    - A year range given -> every SE from week 1 to the last week of each year,
+      capped at the current SE for the in-progress epi year and skipping years
+      entirely in the future (no data yet).
+    """
+    if not start_year and not end_year:
+        return [_current_epi_week()]
+
+    cur_year_s, cur_sem_s = _current_epi_week()
+    cur_year, cur_sem = int(cur_year_s), int(cur_sem_s)
+
+    start = int(start_year or end_year)
+    end = int(end_year or start_year)
+    if start > end:
+        start, end = end, start
+
+    periods: list[tuple[str, str]] = []
+    for yr in range(start, end + 1):
+        if yr > cur_year:
+            continue  # future epi year — nothing to download
+        last = _weeks_in_epi_year(yr)
+        if yr == cur_year:
+            last = min(last, cur_sem)
+        for sem in range(1, last + 1):
+            periods.append((str(yr), str(sem)))
+    return periods
+
+
 async def _faixa_move_all(page, choices_name, values=None):
     """Select option(s) in a dual-list 'choices' select and click its Adicionar (>) button."""
     choices = page.locator(f"select[name='{choices_name}']")
@@ -648,9 +695,70 @@ async def _faixa_definir_faixas(page, faixas, log=print):
         log(f"✓ Faixas etárias definidas: {final_count}/{len(faixas)}")
 
 
+async def _faixa_fetch_one(
+    page, *, us, value, tipo_val, tipo_nome, ano, sem, paths, run_id, log
+) -> Path | None:
+    """Fill the faixa etária form for one (US, tipo, ano, semana), export the
+    Excel and return its saved path (or None if there were no records)."""
+    await _faixa_open_form(page, log)
+
+    # Select the unidade first (its AJAX may populate the period defaults).
+    await _faixa_set_unidade(page, value)
+    await page.wait_for_timeout(1500)
+    await _settle(page)
+
+    # Period: this single epidemiological week (Ano is required; fill it BEFORE
+    # the faixas checkbox, whose Wicket AJAX validates the form).
+    await page.fill("[name='periodo:ano']", ano)
+    await page.fill("[name='periodo:semanaInicial']", sem)
+    await page.fill("[name='periodo:semanaFinal']", sem)
+    await page.locator("[name='periodo:semanaFinal']").press("Tab")
+    await page.wait_for_timeout(800)
+    log(f"Período: ano {ano}, semana epidemiológica {sem}")
+
+    await _faixa_move_all(page, "listaContainerTipoFicha:choices", [tipo_val])
+    await _faixa_move_all(page, "listaContainerTipoExame:choices", ["1", "2"])
+    await _faixa_move_all(page, "listaContainerTipoVirusRespiratorio:choices", None)
+    await _faixa_definir_faixas(page, FAIXAS_ETARIAS, log)
+
+    await page.click("input#consultar")
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(3000)
+    await _settle(page)
+
+    btn = page.locator("input#exportarExcel, input[name='exportarExcel']").first
+    if not await btn.count():
+        if await page.get_by_text("Não existem registros").count():
+            log(f"US {us} {tipo_nome} {ano}/se{sem}: sem registros — pulando.")
+        else:
+            log(f"US {us} {tipo_nome} {ano}/se{sem}: botão Excel ausente — pulando.")
+        return None
+    async with page.expect_download(timeout=120000) as info:
+        await btn.click()
+    dl = await info.value
+    # The portal's suggested filename is mangled (no extension); keep its
+    # extension when present, otherwise default to .xls (legacy Excel).
+    ext = Path(dl.suggested_filename or "").suffix or ".xls"
+    target = paths["downloads"] / (
+        f"faixaetaria_US{us}_{tipo_nome}_{ano}_se{sem}_{run_id}{ext}"
+    )
+    await dl.save_as(str(target))
+    log(f"Excel salvo -> {target}")
+
+    # Voltar to the form for the next iteration.
+    voltar = page.locator("input#voltar, input[name='voltar']").first
+    if await voltar.count():
+        await voltar.click()
+        await page.wait_for_load_state("networkidle")
+        await _settle(page)
+    return target
+
+
 async def run_faixa_etaria(
     *,
     units=None,
+    start_year=None,
+    end_year=None,
     headless: bool = True,
     slow_mo_ms: int = 0,
     log=print,
@@ -659,9 +767,16 @@ async def run_faixa_etaria(
 ) -> list[Path]:
     """Export the 'Distribuição dos vírus por faixa etária' table to Excel.
 
-    For each municipal unit and each ficha type (SG, SRAG UTI), fills the form for the
-    latest epidemiological week, selects all vírus + IFI/PCR + the custom age ranges,
-    clicks Consultar, exports the table to Excel, then Voltar. Returns saved .xls paths.
+    For each municipal unit and each ficha type (SG, SRAG UTI), iterates over the
+    requested epidemiological weeks, selects all vírus + IFI/PCR + the custom age
+    ranges, clicks Consultar, exports the table to Excel, then Voltar.
+
+    Period selection:
+      - ``start_year``/``end_year`` unset -> only the current epidemiological week.
+      - a year range -> every SE (week 1..last) of each year in the interval,
+        capped at the current SE for the in-progress year.
+
+    Returns the saved .xls/.xlsx paths.
     """
     units = units or list(UNIDADES_US.keys())
     paths = _paths(base_dir)
@@ -695,6 +810,15 @@ async def run_faixa_etaria(
         await _settle(page)
         log(f"Login OK -> {page.url}")
 
+        periods = _faixa_periods(start_year, end_year)
+        if not periods:
+            log("Nenhuma semana epidemiológica no intervalo (ano futuro?). Nada a baixar.")
+            return saved
+        log(
+            f"Períodos a baixar: {len(periods)} semana(s) "
+            f"({periods[0][0]}/se{periods[0][1]} … {periods[-1][0]}/se{periods[-1][1]})"
+        )
+
         for us in units:
             if _cancelled():
                 log("Cancelado pelo usuário.")
@@ -707,61 +831,29 @@ async def run_faixa_etaria(
             for tipo_val, tipo_nome in FAIXA_TIPOS_FICHA.items():
                 if _cancelled():
                     break
-                log(f"===== US {us} | {tipo_nome} =====")
-                await _faixa_open_form(page, log)
-
-                # Select the unidade first (its AJAX may populate the period defaults).
-                await _faixa_set_unidade(page, value)
-                await page.wait_for_timeout(1500)
-                await _settle(page)
-
-                # Period = current epidemiological week (Ano is required; fill it BEFORE
-                # the faixas checkbox, whose Wicket AJAX validates the form).
-                ano, sem = _current_epi_week()
-                await page.fill("[name='periodo:ano']", ano)
-                await page.fill("[name='periodo:semanaInicial']", sem)
-                await page.fill("[name='periodo:semanaFinal']", sem)
-                # Nudge Wicket to register the values (blur via Tab).
-                await page.locator("[name='periodo:semanaFinal']").press("Tab")
-                await page.wait_for_timeout(800)
-                log(f"Período: ano {ano}, semana epidemiológica {sem}")
-
-                await _faixa_move_all(page, "listaContainerTipoFicha:choices", [tipo_val])
-                await _faixa_move_all(page, "listaContainerTipoExame:choices", ["1", "2"])
-                await _faixa_move_all(page, "listaContainerTipoVirusRespiratorio:choices", None)
-                await _faixa_definir_faixas(page, FAIXAS_ETARIAS, log)
-
-                await page.click("input#consultar")
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(3000)
-                await _settle(page)
-
-                btn = page.locator("input#exportarExcel, input[name='exportarExcel']").first
-                if not await btn.count():
-                    if await page.get_by_text("Não existem registros").count():
-                        log(f"US {us} {tipo_nome}: sem registros para o período — pulando.")
-                    else:
-                        log(f"US {us} {tipo_nome}: botão Excel ausente — pulando.")
-                    continue
-                async with page.expect_download(timeout=120000) as info:
-                    await btn.click()
-                dl = await info.value
-                # The portal's suggested filename is mangled (no extension); keep its
-                # extension when present, otherwise default to .xls (legacy Excel).
-                ext = Path(dl.suggested_filename or "").suffix or ".xls"
-                target = paths["downloads"] / (
-                    f"faixaetaria_US{us}_{tipo_nome}_{ano}_se{sem}_{run_id}{ext}"
-                )
-                await dl.save_as(str(target))
-                saved.append(target)
-                log(f"Excel salvo -> {target}")
-
-                # Voltar to the form for the next iteration.
-                voltar = page.locator("input#voltar, input[name='voltar']").first
-                if await voltar.count():
-                    await voltar.click()
-                    await page.wait_for_load_state("networkidle")
-                    await _settle(page)
+                log(f"===== US {us} | {tipo_nome} | {len(periods)} semana(s) =====")
+                for ano, sem in periods:
+                    if _cancelled():
+                        log("Cancelado pelo usuário.")
+                        break
+                    try:
+                        target = await _faixa_fetch_one(
+                            page,
+                            us=us,
+                            value=value,
+                            tipo_val=tipo_val,
+                            tipo_nome=tipo_nome,
+                            ano=ano,
+                            sem=sem,
+                            paths=paths,
+                            run_id=run_id,
+                            log=log,
+                        )
+                        if target:
+                            saved.append(target)
+                    except Exception as e:
+                        # Don't let one bad week abort a long multi-year run.
+                        log(f"US {us} {tipo_nome} {ano}/se{sem}: erro — {e}; continuando.")
     finally:
         await context.close()
         await browser.close()
