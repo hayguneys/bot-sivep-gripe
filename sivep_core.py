@@ -766,6 +766,61 @@ async def _faixa_fetch_one(
     return target
 
 
+async def _run_units_concurrently(
+    browser, login, senha, units, max_concurrent, process_unit, log, cancelled
+) -> list[Path]:
+    """Run ``process_unit(page, us)`` for each unit, up to ``max_concurrent``
+    at a time, each in its own browser context with its OWN independent login.
+
+    SIVEP's Wicket app does not tolerate concurrent use of a single shared
+    session: confirmed live that seeding multiple concurrent contexts with
+    one login's storage_state makes ALL of them fail to navigate (Wicket's
+    server-side page-version tracking conflicts across simultaneous requests
+    on the same session). Independent logins per context, run concurrently,
+    work fine and don't interfere with each other -- so each unit gets its
+    own full login instead of sharing one.
+
+    Returns the saved paths from all units, flattened, in unit order.
+    """
+    sem = asyncio.Semaphore(max(1, max_concurrent))
+    results: dict[str, list[Path]] = {}
+
+    async def worker(us):
+        if cancelled():
+            return
+        async with sem:
+            if cancelled():
+                return
+            context = await browser.new_context(accept_downloads=True)
+            page = await context.new_page()
+            try:
+                await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+                await page.wait_for_timeout(1500)
+                if "login.html" in page.url:
+                    await page.fill("input[name='email']", login)
+                    await page.fill("input[name='senha']", senha)
+                    await page.click("input[type='submit'][name='ENTRAR']")
+                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_timeout(2000)
+                    if "login.html" in page.url:
+                        log(f"US {us}: login falhou nesta aba concorrente — pulando unidade.")
+                        results[us] = []
+                        return
+                await _settle(page)
+                results[us] = await process_unit(page, us)
+            except Exception as e:
+                log(f"US {us}: erro fatal na aba concorrente — {e}; unidade abortada.")
+                results[us] = []
+            finally:
+                await context.close()
+
+    await asyncio.gather(*(worker(us) for us in units))
+    saved: list[Path] = []
+    for us in units:
+        saved.extend(results.get(us, []))
+    return saved
+
+
 async def run_faixa_etaria(
     *,
     units=None,
@@ -773,6 +828,7 @@ async def run_faixa_etaria(
     end_year=None,
     start_week=None,
     end_week=None,
+    max_concurrent_units: int = 1,
     headless: bool = True,
     slow_mo_ms: int = 0,
     log=print,
@@ -793,6 +849,11 @@ async def run_faixa_etaria(
         SIVEP form's own Semana Inicial/Semana Final fields: start_week bounds
         the first year, end_week bounds the last year (both apply together
         when start_year == end_year).
+
+    ``max_concurrent_units`` (default 1 = sequential, unchanged behavior): run
+    up to that many units at once, each in its own browser tab with its own
+    independent login (SIVEP's Wicket session does not tolerate sharing one
+    login across concurrent tabs -- confirmed live).
 
     Returns the saved .xls/.xlsx paths.
     """
@@ -837,15 +898,12 @@ async def run_faixa_etaria(
             f"({periods[0][0]}/se{periods[0][1]} … {periods[-1][0]}/se{periods[-1][1]})"
         )
 
-        for us in units:
-            if _cancelled():
-                log("Cancelado pelo usuário.")
-                break
+        async def _process_unit(unit_page, us) -> list[Path]:
+            unit_saved: list[Path] = []
             value = UNIDADES_US.get(us)
             if not value:
                 log(f"US {us} não está na lista desta conta — pulando.")
-                continue
-
+                return unit_saved
             for tipo_val, tipo_nome in FAIXA_TIPOS_FICHA.items():
                 if _cancelled():
                     break
@@ -856,7 +914,7 @@ async def run_faixa_etaria(
                         break
                     try:
                         target = await _faixa_fetch_one(
-                            page,
+                            unit_page,
                             us=us,
                             value=value,
                             tipo_val=tipo_val,
@@ -868,10 +926,26 @@ async def run_faixa_etaria(
                             log=log,
                         )
                         if target:
-                            saved.append(target)
+                            unit_saved.append(target)
                     except Exception as e:
                         # Don't let one bad week abort a long multi-year run.
                         log(f"US {us} {tipo_nome} {ano}/se{sem}: erro — {e}; continuando.")
+            return unit_saved
+
+        if max_concurrent_units <= 1 or len(units) <= 1:
+            for us in units:
+                if _cancelled():
+                    log("Cancelado pelo usuário.")
+                    break
+                saved.extend(await _process_unit(page, us))
+        else:
+            n = min(max_concurrent_units, len(units))
+            log(f"Executando {len(units)} unidade(s) com até {n} em paralelo (uma sessão por unidade).")
+            saved.extend(
+                await _run_units_concurrently(
+                    browser, login, senha, units, n, _process_unit, log, _cancelled
+                )
+            )
     finally:
         await context.close()
         await browser.close()
@@ -1013,6 +1087,7 @@ async def run_consultas_faixa_sexo(
     end_year=None,
     start_week=None,
     end_week=None,
+    max_concurrent_units: int = 1,
     headless: bool = True,
     slow_mo_ms: int = 0,
     log=print,
@@ -1030,7 +1105,14 @@ async def run_consultas_faixa_sexo(
     ``start_week``/``end_week`` (optional) narrow the year range, mirroring the
     SIVEP form's own Semana Inicial/Semana Final fields: start_week bounds the
     first year, end_week bounds the last year (both apply together when
-    start_year == end_year). Returns the saved .xls/.xlsx paths.
+    start_year == end_year).
+
+    ``max_concurrent_units`` (default 1 = sequential, unchanged behavior): run
+    up to that many units at once, each in its own browser tab with its own
+    independent login (SIVEP's Wicket session does not tolerate sharing one
+    login across concurrent tabs -- confirmed live).
+
+    Returns the saved .xls/.xlsx paths.
     """
     units = units or list(UNIDADES_US.keys())
     paths = _paths(base_dir)
@@ -1073,15 +1155,12 @@ async def run_consultas_faixa_sexo(
             f"({periods[0][0]}/se{periods[0][1]} … {periods[-1][0]}/se{periods[-1][1]})"
         )
 
-        for us in units:
-            if _cancelled():
-                log("Cancelado pelo usuário.")
-                break
+        async def _process_unit(unit_page, us) -> list[Path]:
+            unit_saved: list[Path] = []
             value = UNIDADES_US.get(us)
             if not value:
                 log(f"US {us} não está na lista desta conta — pulando.")
-                continue
-
+                return unit_saved
             log(f"===== US {us} | SG | {len(periods)} semana(s) =====")
             for ano, sem in periods:
                 if _cancelled():
@@ -1089,7 +1168,7 @@ async def run_consultas_faixa_sexo(
                     break
                 try:
                     target = await _consultas_fetch_one(
-                        page,
+                        unit_page,
                         us=us,
                         value=value,
                         ano=ano,
@@ -1099,10 +1178,26 @@ async def run_consultas_faixa_sexo(
                         log=log,
                     )
                     if target:
-                        saved.append(target)
+                        unit_saved.append(target)
                 except Exception as e:
                     # Don't let one bad week abort a long multi-year run.
                     log(f"US {us} SG {ano}/se{sem}: erro — {e}; continuando.")
+            return unit_saved
+
+        if max_concurrent_units <= 1 or len(units) <= 1:
+            for us in units:
+                if _cancelled():
+                    log("Cancelado pelo usuário.")
+                    break
+                saved.extend(await _process_unit(page, us))
+        else:
+            n = min(max_concurrent_units, len(units))
+            log(f"Executando {len(units)} unidade(s) com até {n} em paralelo (uma sessão por unidade).")
+            saved.extend(
+                await _run_units_concurrently(
+                    browser, login, senha, units, n, _process_unit, log, _cancelled
+                )
+            )
     finally:
         await context.close()
         await browser.close()

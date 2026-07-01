@@ -92,7 +92,10 @@ class FaixaWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, units, headless, start_year=None, end_year=None, start_week=None, end_week=None):
+    def __init__(
+        self, units, headless, start_year=None, end_year=None,
+        start_week=None, end_week=None, max_concurrent_units=1,
+    ):
         super().__init__()
         self._units = units
         self._headless = headless
@@ -100,6 +103,7 @@ class FaixaWorker(QThread):
         self._end_year = end_year
         self._start_week = start_week
         self._end_week = end_week
+        self._max_concurrent_units = max_concurrent_units
         self._cancel = False
 
     def cancel(self):
@@ -113,6 +117,7 @@ class FaixaWorker(QThread):
                 end_year=self._end_year,
                 start_week=self._start_week,
                 end_week=self._end_week,
+                max_concurrent_units=self._max_concurrent_units,
                 headless=self._headless,
                 slow_mo_ms=0 if self._headless else 200,
                 log=self.message.emit,
@@ -131,7 +136,10 @@ class ConsultasWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, units, headless, start_year=None, end_year=None, start_week=None, end_week=None):
+    def __init__(
+        self, units, headless, start_year=None, end_year=None,
+        start_week=None, end_week=None, max_concurrent_units=1,
+    ):
         super().__init__()
         self._units = units
         self._headless = headless
@@ -139,6 +147,7 @@ class ConsultasWorker(QThread):
         self._end_year = end_year
         self._start_week = start_week
         self._end_week = end_week
+        self._max_concurrent_units = max_concurrent_units
         self._cancel = False
 
     def cancel(self):
@@ -152,6 +161,7 @@ class ConsultasWorker(QThread):
                 end_year=self._end_year,
                 start_week=self._start_week,
                 end_week=self._end_week,
+                max_concurrent_units=self._max_concurrent_units,
                 headless=self._headless,
                 slow_mo_ms=0 if self._headless else 200,
                 log=self.message.emit,
@@ -569,6 +579,12 @@ class FaixaEtariaTab(QWidget):
         opts = QHBoxLayout()
         self.chk_headless = QCheckBox("Navegador invisível (headless)")
         opts.addWidget(self.chk_headless)
+        opts.addSpacing(20)
+        opts.addWidget(QLabel("Downloads simultâneos (uma unidade por aba):"))
+        self.spin_concurrent = QSpinBox()
+        self.spin_concurrent.setRange(1, len(sivep_core.UNIDADES_US))
+        self.spin_concurrent.setValue(1)
+        opts.addWidget(self.spin_concurrent)
         opts.addStretch()
         layout.addLayout(opts)
 
@@ -601,16 +617,23 @@ class FaixaEtariaTab(QWidget):
             return
 
         start_year, end_year, start_week, end_week = self.period.values()
+        max_concurrent = min(self.spin_concurrent.value(), len(units))
 
         # Estimate the workload and confirm before a long multi-week run.
         n_weeks = len(sivep_core._faixa_periods(start_year, end_year, start_week, end_week))
         n_total = n_weeks * len(units) * len(sivep_core.FAIXA_TIPOS_FICHA)
+        concurrency_note = (
+            f"Até {max_concurrent} unidade(s) em paralelo (uma sessão por unidade).\n"
+            if max_concurrent > 1
+            else ""
+        )
         resp = QMessageBox.question(
             self,
             "Confirmar download",
             f"Período: {start_year} se{start_week} – {end_year} se{end_week} "
             f"({n_weeks} semana(s) epidemiológica(s)).\n"
-            f"Unidades: {len(units)} · Fichas: {len(sivep_core.FAIXA_TIPOS_FICHA)} (SG, SRAG UTI).\n\n"
+            f"Unidades: {len(units)} · Fichas: {len(sivep_core.FAIXA_TIPOS_FICHA)} (SG, SRAG UTI).\n"
+            f"{concurrency_note}\n"
             f"Total estimado: {n_total} exportações Excel.\n"
             "Isso pode demorar bastante. Deseja continuar?",
             QMessageBox.Yes | QMessageBox.No,
@@ -628,6 +651,7 @@ class FaixaEtariaTab(QWidget):
             end_year=end_year,
             start_week=start_week,
             end_week=end_week,
+            max_concurrent_units=max_concurrent,
         )
         self._worker.message.connect(self.log.appendPlainText)
         self._worker.finished_ok.connect(self._done)
@@ -689,6 +713,12 @@ class ConsultasTab(QWidget):
         opts = QHBoxLayout()
         self.chk_headless = QCheckBox("Navegador invisível (headless)")
         opts.addWidget(self.chk_headless)
+        opts.addSpacing(20)
+        opts.addWidget(QLabel("Downloads simultâneos (uma unidade por aba):"))
+        self.spin_concurrent = QSpinBox()
+        self.spin_concurrent.setRange(1, len(sivep_core.UNIDADES_US))
+        self.spin_concurrent.setValue(1)
+        opts.addWidget(self.spin_concurrent)
         opts.addStretch()
         layout.addLayout(opts)
 
@@ -721,16 +751,23 @@ class ConsultasTab(QWidget):
             return
 
         start_year, end_year, start_week, end_week = self.period.values()
+        max_concurrent = min(self.spin_concurrent.value(), len(units))
 
         # Estimate the workload and confirm before a long multi-week run.
         n_weeks = len(sivep_core._faixa_periods(start_year, end_year, start_week, end_week))
         n_total = n_weeks * len(units)
+        concurrency_note = (
+            f"Até {max_concurrent} unidade(s) em paralelo (uma sessão por unidade).\n"
+            if max_concurrent > 1
+            else ""
+        )
         resp = QMessageBox.question(
             self,
             "Confirmar download",
             f"Período: {start_year} se{start_week} – {end_year} se{end_week} "
             f"({n_weeks} semana(s) epidemiológica(s)).\n"
-            f"Unidades: {len(units)} · Ficha: Atendimentos por SG.\n\n"
+            f"Unidades: {len(units)} · Ficha: Atendimentos por SG.\n"
+            f"{concurrency_note}\n"
             f"Total estimado: {n_total} exportações Excel.\n"
             "Isso pode demorar bastante. Deseja continuar?",
             QMessageBox.Yes | QMessageBox.No,
@@ -748,6 +785,7 @@ class ConsultasTab(QWidget):
             end_year=end_year,
             start_week=start_week,
             end_week=end_week,
+            max_concurrent_units=max_concurrent,
         )
         self._worker.message.connect(self.log.appendPlainText)
         self._worker.finished_ok.connect(self._done)
