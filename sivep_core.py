@@ -872,6 +872,231 @@ def run_faixa_etaria_sync(*args, **kwargs) -> list[Path]:
     return asyncio.run(run_faixa_etaria(*args, **kwargs))
 
 
+# --------------------------------------------------------------------------- #
+# Relatório: Agregados > Distribuição por Faixa Etária e Sexo ("Consultas" tab).
+# RELATÓRIOS -> AGREGADOS -> DISTRIBUIÇÃO POR FAIXA ETÁRIA E SEXO
+# Uses the same #unidadeSentinela widget/values as UNIDADES_US (confirmed live:
+# both reports share the same select). Ficha fixed to "Atendimentos por SG".
+# One Excel per US per epidemiological week (semanaInicial == semanaFinal).
+# --------------------------------------------------------------------------- #
+
+# "Atendimentos por SG" option value on this report's plain #tipoFicha select
+# (a single <select>, not the dual-list widget the other Faixa Etária report uses).
+CONSULTAS_TIPO_FICHA_SG = "1"
+
+
+async def _consultas_open_form(page, log=print):
+    """Navigate RELATÓRIOS -> AGREGADOS -> DISTRIBUIÇÃO POR FAIXA ETÁRIA E SEXO."""
+    for attempt in range(2):
+        await page.goto(PRINCIPAL_URL, wait_until="networkidle")
+        await _settle(page)
+        await page.locator("a.sf-with-ul[alt*='RELAT']").first.hover()
+        await page.wait_for_timeout(800)
+        # AGREGADOS appears under several top-level menus (ENTRADA DE DADOS,
+        # CONSULTA, RELATÓRIOS...); only the one visible after hovering
+        # RELATÓRIOS is the submenu we want.
+        agregados = page.locator("a.sf-with-ul[alt*='AGREGADO']")
+        for i in range(await agregados.count()):
+            if await agregados.nth(i).is_visible():
+                await agregados.nth(i).hover()
+                break
+        await page.wait_for_timeout(800)
+        # The DOM has a hidden duplicate of this link (from another top-level
+        # menu context, e.g. ENTRADA DE DADOS/CONSULTA also nest an AGREGADOS
+        # submenu) *before* the visible one in document order -- a plain
+        # querySelectorAll+regex .find() grabs that inert hidden copy and the
+        # click does nothing. Filter to the visible match instead (confirmed
+        # live: 2 matches for this text, only the 2nd is visible).
+        link = page.locator("a", has_text="FAIXA ET").locator("visible=true").first
+        await link.click()
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(2000)
+        await _settle(page)
+        try:
+            await page.wait_for_selector("#unidadeSentinela", state="attached", timeout=15000)
+            return
+        except Exception:
+            log(f"Formulário de Consultas (faixa etária e sexo) não carregou (tentativa {attempt + 1}).")
+    raise RuntimeError("Não foi possível abrir o formulário de Distribuição por Faixa Etária e Sexo.")
+
+
+async def _consultas_set_periodo(page, ano, sem, log=print):
+    """Set periodo:ano and a single epidemiological week (semanaInicial == semanaFinal).
+
+    Blurring the 'ano' field fires a Wicket AJAX that auto-fills
+    semanaInicial=1 / semanaFinal=<last SE of that year> -- filling the week
+    fields BEFORE that AJAX resolves gets silently clobbered by it (confirmed
+    live: values reverted to the auto-filled defaults). Waiting for it to
+    fully settle before overwriting semanaInicial/semanaFinal avoids the race.
+    """
+    await page.fill("[name='periodo:ano']", ano)
+    await page.locator("[name='periodo:ano']").press("Tab")
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1200)
+    await _settle(page)
+
+    await page.fill("[name='periodo:semanaInicial']", sem)
+    await page.fill("[name='periodo:semanaFinal']", sem)
+    await page.locator("[name='periodo:semanaFinal']").press("Tab")
+    await page.wait_for_timeout(800)
+    log(f"Período: ano {ano}, semana epidemiológica {sem}")
+
+
+async def _consultas_fetch_one(page, *, us, value, ano, sem, paths, run_id, log) -> Path | None:
+    """Fill the Consultas (Agregados > Faixa Etária e Sexo) form for one
+    (US, ano, semana), export the Excel and return its saved path (or None
+    if there were no records for that week)."""
+    await _consultas_open_form(page, log)
+
+    await page.select_option("select#tipoFicha", CONSULTAS_TIPO_FICHA_SG)
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(800)
+    await _settle(page)
+
+    await _faixa_set_unidade(page, value)  # same #unidadeSentinela widget/values
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1200)
+    await _settle(page)
+
+    await _consultas_set_periodo(page, ano, sem, log)
+
+    await page.click("input[name='consultar']")
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(2000)
+    await _settle(page)
+
+    btn = page.locator("input[name='exportarExcel']").first
+    if not await btn.count():
+        if await page.get_by_text("Não existem registros").count():
+            log(f"US {us} SG {ano}/se{sem}: sem registros — pulando.")
+        else:
+            log(f"US {us} SG {ano}/se{sem}: botão Excel ausente — pulando.")
+        return None
+    async with page.expect_download(timeout=120000) as info:
+        await btn.click()
+    dl = await info.value
+    ext = Path(dl.suggested_filename or "").suffix or ".xls"
+    target = paths["downloads"] / f"consultas_US{us}_SG_{ano}_se{sem}_{run_id}{ext}"
+    await dl.save_as(str(target))
+    log(f"Excel salvo -> {target}")
+
+    voltar = page.locator("input[name='voltar']").first
+    if await voltar.count():
+        await voltar.click()
+        await page.wait_for_load_state("networkidle")
+        await _settle(page)
+    return target
+
+
+async def run_consultas_faixa_sexo(
+    *,
+    units=None,
+    start_year=None,
+    end_year=None,
+    headless: bool = True,
+    slow_mo_ms: int = 0,
+    log=print,
+    base_dir: Path | None = None,
+    should_cancel=None,
+) -> list[Path]:
+    """Export RELATÓRIOS -> AGREGADOS -> DISTRIBUIÇÃO POR FAIXA ETÁRIA E SEXO.
+
+    Ficha fixed to "Atendimentos por SG". For each unit and each epidemiological
+    week in [start_year, end_year] (semanaInicial == semanaFinal, one week at a
+    time, progressing week by week), fills the form, clicks Consultar, and
+    exports the Excel if there are records. Weeks with no records, or that
+    error, are skipped and the run continues to the next week. Returns the
+    saved .xls/.xlsx paths.
+    """
+    units = units or list(UNIDADES_US.keys())
+    paths = _paths(base_dir)
+    ensure_chromium(paths["browsers"], log=log)
+    login, senha = load_credentials(paths["project"])
+    if not (login and senha):
+        raise RuntimeError("Missing credentials (set them in the GUI / .env).")
+
+    def _cancelled():
+        return bool(should_cancel and should_cancel())
+
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved: list[Path] = []
+
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
+    context = await browser.new_context(accept_downloads=True)
+    page = await context.new_page()
+    try:
+        # Login.
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+        if "login.html" in page.url:
+            await page.fill("input[name='email']", login)
+            await page.fill("input[name='senha']", senha)
+            await page.click("input[type='submit'][name='ENTRAR']")
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(2000)
+            if "login.html" in page.url:
+                raise RuntimeError("Login falhou — confira as credenciais.")
+        await _settle(page)
+        log(f"Login OK -> {page.url}")
+
+        periods = _faixa_periods(start_year, end_year)
+        if not periods:
+            log("Nenhuma semana epidemiológica no intervalo (ano futuro?). Nada a baixar.")
+            return saved
+        log(
+            f"Períodos a baixar: {len(periods)} semana(s) "
+            f"({periods[0][0]}/se{periods[0][1]} … {periods[-1][0]}/se{periods[-1][1]})"
+        )
+
+        for us in units:
+            if _cancelled():
+                log("Cancelado pelo usuário.")
+                break
+            value = UNIDADES_US.get(us)
+            if not value:
+                log(f"US {us} não está na lista desta conta — pulando.")
+                continue
+
+            log(f"===== US {us} | SG | {len(periods)} semana(s) =====")
+            for ano, sem in periods:
+                if _cancelled():
+                    log("Cancelado pelo usuário.")
+                    break
+                try:
+                    target = await _consultas_fetch_one(
+                        page,
+                        us=us,
+                        value=value,
+                        ano=ano,
+                        sem=sem,
+                        paths=paths,
+                        run_id=run_id,
+                        log=log,
+                    )
+                    if target:
+                        saved.append(target)
+                except Exception as e:
+                    # Don't let one bad week abort a long multi-year run.
+                    log(f"US {us} SG {ano}/se{sem}: erro — {e}; continuando.")
+    finally:
+        await context.close()
+        await browser.close()
+        await pw.stop()
+
+    log("===== CONSULTAS (FAIXA ETÁRIA E SEXO): concluído =====")
+    for f in saved:
+        log(f"  salvo: {f}")
+    return saved
+
+
+def run_consultas_faixa_sexo_sync(*args, **kwargs) -> list[Path]:
+    """Blocking wrapper around :func:`run_consultas_faixa_sexo` (UI thread / CLI)."""
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    return asyncio.run(run_consultas_faixa_sexo(*args, **kwargs))
+
+
 if __name__ == "__main__":
     # Minimal CLI: python sivep_core.py 2024 3,1
     import argparse

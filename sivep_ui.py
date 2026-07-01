@@ -119,6 +119,41 @@ class FaixaWorker(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class ConsultasWorker(QThread):
+    """Background worker for the Agregados > Distribuição por Faixa Etária e
+    Sexo export (Atendimentos SG), one epidemiological week at a time."""
+
+    message = Signal(str)
+    finished_ok = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, units, headless, start_year=None, end_year=None):
+        super().__init__()
+        self._units = units
+        self._headless = headless
+        self._start_year = start_year
+        self._end_year = end_year
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            files = sivep_core.run_consultas_faixa_sexo_sync(
+                units=self._units,
+                start_year=self._start_year,
+                end_year=self._end_year,
+                headless=self._headless,
+                slow_mo_ms=0 if self._headless else 200,
+                log=self.message.emit,
+                should_cancel=lambda: self._cancel,
+            )
+            self.finished_ok.emit([str(f) for f in files])
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 # --------------------------------------------------------------------------- #
 # DBF table model.
 # --------------------------------------------------------------------------- #
@@ -548,6 +583,142 @@ class FaixaEtariaTab(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+# Consultas tab — Agregados > Distribuição por Faixa Etária e Sexo (Atendimentos SG).
+# --------------------------------------------------------------------------- #
+
+class ConsultasTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._worker: ConsultasWorker | None = None
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Exporta para Excel 'Relatório > Agregados > Distribuição por Faixa Etária e Sexo'\n"
+            "(ficha: Atendimentos por SG), baixando cada Semana Epidemiológica do\n"
+            "intervalo de anos selecionado (uma semana por vez) para cada unidade selecionada.\n"
+            "Semanas sem registros, ou que falharem, são puladas automaticamente."
+        )
+        layout.addWidget(info)
+
+        # Year interval: download every SE from each year in [inicial, final].
+        cur_year = int(sivep_core._current_epi_week()[0])
+        years = [str(y) for y in range(cur_year, 2008, -1)]  # current -> 2009
+        period_box = QGroupBox("Intervalo de anos (Semana Epidemiológica)")
+        period_l = QHBoxLayout(period_box)
+        period_l.addWidget(QLabel("Ano inicial:"))
+        self.cmb_start_year = QComboBox()
+        self.cmb_start_year.addItems(years)
+        period_l.addWidget(self.cmb_start_year)
+        period_l.addSpacing(20)
+        period_l.addWidget(QLabel("Ano final:"))
+        self.cmb_end_year = QComboBox()
+        self.cmb_end_year.addItems(years)
+        period_l.addWidget(self.cmb_end_year)
+        period_l.addStretch()
+        self.cmb_start_year.setCurrentText(str(cur_year))
+        self.cmb_end_year.setCurrentText(str(cur_year))
+        layout.addWidget(period_box)
+
+        box = QGroupBox("Unidades (US)")
+        box_l = QHBoxLayout(box)
+        self._unit_checks = {}
+        for us in sivep_core.UNIDADES_US:
+            cb = QCheckBox(f"US {us}")
+            cb.setChecked(True)
+            self._unit_checks[us] = cb
+            box_l.addWidget(cb)
+        box_l.addStretch()
+        layout.addWidget(box)
+
+        opts = QHBoxLayout()
+        self.chk_headless = QCheckBox("Navegador invisível (headless)")
+        opts.addWidget(self.chk_headless)
+        opts.addStretch()
+        layout.addLayout(opts)
+
+        btns = QHBoxLayout()
+        self.btn_run = QPushButton("▶ Exportar Excel")
+        self.btn_run.clicked.connect(self._start)
+        self.btn_stop = QPushButton("■ Parar")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop)
+        btns.addWidget(self.btn_run)
+        btns.addWidget(self.btn_stop)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        layout.addWidget(QLabel("Log:"))
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        layout.addWidget(self.log, 1)
+
+    def _start(self):
+        login, senha = sivep_core.load_credentials()
+        if not (login and senha):
+            QMessageBox.warning(
+                self, "Credenciais", "Informe login e senha na aba Runner primeiro."
+            )
+            return
+        units = [us for us, cb in self._unit_checks.items() if cb.isChecked()]
+        if not units:
+            QMessageBox.warning(self, "Unidades", "Selecione ao menos uma unidade.")
+            return
+
+        start_year = int(self.cmb_start_year.currentText())
+        end_year = int(self.cmb_end_year.currentText())
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
+
+        # Estimate the workload and confirm before a long multi-week run.
+        n_weeks = len(sivep_core._faixa_periods(start_year, end_year))
+        n_total = n_weeks * len(units)
+        resp = QMessageBox.question(
+            self,
+            "Confirmar download",
+            f"Período: {start_year}–{end_year} ({n_weeks} semana(s) epidemiológica(s)).\n"
+            f"Unidades: {len(units)} · Ficha: Atendimentos por SG.\n\n"
+            f"Total estimado: {n_total} exportações Excel.\n"
+            "Isso pode demorar bastante. Deseja continuar?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if resp != QMessageBox.Yes:
+            return
+
+        self.log.clear()
+        self._set_running(True)
+        self._worker = ConsultasWorker(
+            units,
+            headless=self.chk_headless.isChecked(),
+            start_year=start_year,
+            end_year=end_year,
+        )
+        self._worker.message.connect(self.log.appendPlainText)
+        self._worker.finished_ok.connect(self._done)
+        self._worker.failed.connect(self._error)
+        self._worker.start()
+
+    def _stop(self):
+        if self._worker:
+            self.log.appendPlainText(">> Parando após a etapa atual…")
+            self._worker.cancel()
+            self.btn_stop.setEnabled(False)
+
+    def _done(self, files):
+        self._set_running(False)
+        self.log.appendPlainText(f">> Concluído. {len(files)} arquivo(s) Excel salvo(s).")
+
+    def _error(self, msg):
+        self._set_running(False)
+        self.log.appendPlainText(f">> ERRO: {msg}")
+        QMessageBox.critical(self, "Erro na execução", msg)
+
+    def _set_running(self, running):
+        self.btn_run.setEnabled(not running)
+        self.btn_stop.setEnabled(running)
+
+
+# --------------------------------------------------------------------------- #
 # Main window.
 # --------------------------------------------------------------------------- #
 
@@ -561,8 +732,10 @@ class MainWindow(QMainWindow):
         self.viewer = ViewerTab()
         self.runner = RunnerTab(on_run_finished=self.viewer.refresh_list)
         self.faixa = FaixaEtariaTab()
+        self.consultas = ConsultasTab()
         tabs.addTab(self.runner, "Runner")
         tabs.addTab(self.faixa, "Faixa Etária")
+        tabs.addTab(self.consultas, "Consultas")
         tabs.addTab(self.viewer, "DBF Viewer")
         self.setCentralWidget(tabs)
 
