@@ -591,7 +591,7 @@ def _weeks_in_epi_year(year: int) -> int:
     return (week1_start(year + 1) - week1_start(year)).days // 7
 
 
-def _faixa_periods(start_year=None, end_year=None) -> list[tuple[str, str]]:
+def _faixa_periods(start_year=None, end_year=None, start_week=None, end_week=None) -> list[tuple[str, str]]:
     """Build the list of (ano, semana) periods to fetch for faixa etária.
 
     - No years given -> just the current epidemiological week (preserves the
@@ -599,6 +599,12 @@ def _faixa_periods(start_year=None, end_year=None) -> list[tuple[str, str]]:
     - A year range given -> every SE from week 1 to the last week of each year,
       capped at the current SE for the in-progress epi year and skipping years
       entirely in the future (no data yet).
+    - start_week/end_week (optional) narrow that default range, mirroring the
+      SIVEP form's own Semana Inicial/Semana Final fields: start_week bounds
+      the FIRST year in the interval, end_week bounds the LAST year -- so for
+      a single-year interval (start_year == end_year) both apply together to
+      that one year, exactly like the site. Values are clamped into the valid
+      1..last-week-of-that-year span (and the current-year cap still applies).
     """
     if not start_year and not end_year:
         return [_current_epi_week()]
@@ -618,7 +624,13 @@ def _faixa_periods(start_year=None, end_year=None) -> list[tuple[str, str]]:
         last = _weeks_in_epi_year(yr)
         if yr == cur_year:
             last = min(last, cur_sem)
-        for sem in range(1, last + 1):
+
+        floor = max(1, min(int(start_week), last)) if (yr == start and start_week) else 1
+        ceiling = max(1, min(int(end_week), last)) if (yr == end and end_week) else last
+        if floor > ceiling:
+            floor, ceiling = ceiling, floor
+
+        for sem in range(floor, ceiling + 1):
             periods.append((str(yr), str(sem)))
     return periods
 
@@ -759,6 +771,8 @@ async def run_faixa_etaria(
     units=None,
     start_year=None,
     end_year=None,
+    start_week=None,
+    end_week=None,
     headless: bool = True,
     slow_mo_ms: int = 0,
     log=print,
@@ -775,6 +789,10 @@ async def run_faixa_etaria(
       - ``start_year``/``end_year`` unset -> only the current epidemiological week.
       - a year range -> every SE (week 1..last) of each year in the interval,
         capped at the current SE for the in-progress year.
+      - ``start_week``/``end_week`` (optional) narrow that range, mirroring the
+        SIVEP form's own Semana Inicial/Semana Final fields: start_week bounds
+        the first year, end_week bounds the last year (both apply together
+        when start_year == end_year).
 
     Returns the saved .xls/.xlsx paths.
     """
@@ -810,7 +828,7 @@ async def run_faixa_etaria(
         await _settle(page)
         log(f"Login OK -> {page.url}")
 
-        periods = _faixa_periods(start_year, end_year)
+        periods = _faixa_periods(start_year, end_year, start_week, end_week)
         if not periods:
             log("Nenhuma semana epidemiológica no intervalo (ano futuro?). Nada a baixar.")
             return saved
@@ -993,6 +1011,8 @@ async def run_consultas_faixa_sexo(
     units=None,
     start_year=None,
     end_year=None,
+    start_week=None,
+    end_week=None,
     headless: bool = True,
     slow_mo_ms: int = 0,
     log=print,
@@ -1005,8 +1025,12 @@ async def run_consultas_faixa_sexo(
     week in [start_year, end_year] (semanaInicial == semanaFinal, one week at a
     time, progressing week by week), fills the form, clicks Consultar, and
     exports the Excel if there are records. Weeks with no records, or that
-    error, are skipped and the run continues to the next week. Returns the
-    saved .xls/.xlsx paths.
+    error, are skipped and the run continues to the next week.
+
+    ``start_week``/``end_week`` (optional) narrow the year range, mirroring the
+    SIVEP form's own Semana Inicial/Semana Final fields: start_week bounds the
+    first year, end_week bounds the last year (both apply together when
+    start_year == end_year). Returns the saved .xls/.xlsx paths.
     """
     units = units or list(UNIDADES_US.keys())
     paths = _paths(base_dir)
@@ -1040,7 +1064,7 @@ async def run_consultas_faixa_sexo(
         await _settle(page)
         log(f"Login OK -> {page.url}")
 
-        periods = _faixa_periods(start_year, end_year)
+        periods = _faixa_periods(start_year, end_year, start_week, end_week)
         if not periods:
             log("Nenhuma semana epidemiológica no intervalo (ano futuro?). Nada a baixar.")
             return saved

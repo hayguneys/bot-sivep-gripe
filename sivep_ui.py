@@ -92,12 +92,14 @@ class FaixaWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, units, headless, start_year=None, end_year=None):
+    def __init__(self, units, headless, start_year=None, end_year=None, start_week=None, end_week=None):
         super().__init__()
         self._units = units
         self._headless = headless
         self._start_year = start_year
         self._end_year = end_year
+        self._start_week = start_week
+        self._end_week = end_week
         self._cancel = False
 
     def cancel(self):
@@ -109,6 +111,8 @@ class FaixaWorker(QThread):
                 units=self._units,
                 start_year=self._start_year,
                 end_year=self._end_year,
+                start_week=self._start_week,
+                end_week=self._end_week,
                 headless=self._headless,
                 slow_mo_ms=0 if self._headless else 200,
                 log=self.message.emit,
@@ -127,12 +131,14 @@ class ConsultasWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, units, headless, start_year=None, end_year=None):
+    def __init__(self, units, headless, start_year=None, end_year=None, start_week=None, end_week=None):
         super().__init__()
         self._units = units
         self._headless = headless
         self._start_year = start_year
         self._end_year = end_year
+        self._start_week = start_week
+        self._end_week = end_week
         self._cancel = False
 
     def cancel(self):
@@ -144,6 +150,8 @@ class ConsultasWorker(QThread):
                 units=self._units,
                 start_year=self._start_year,
                 end_year=self._end_year,
+                start_week=self._start_week,
+                end_week=self._end_week,
                 headless=self._headless,
                 slow_mo_ms=0 if self._headless else 200,
                 log=self.message.emit,
@@ -442,6 +450,87 @@ class ViewerTab(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+# Shared period selector — Ano inicial/final + Semana Inicial/Final, mirroring
+# the SIVEP form's own Período fields (used by Faixa Etária and Consultas tabs).
+# --------------------------------------------------------------------------- #
+
+def _max_week_for_year(year: int) -> int:
+    """Max selectable Semana Epidemiológica for `year`: the full week count,
+    or the current SE if `year` is still in progress (mirrors the per-year
+    cap that _faixa_periods() applies when actually downloading)."""
+    cur_year, cur_sem = (int(x) for x in sivep_core._current_epi_week())
+    last = sivep_core._weeks_in_epi_year(year)
+    return min(last, cur_sem) if year == cur_year else last
+
+
+class PeriodSelector(QGroupBox):
+    """Ano inicial/final + Semana Inicial/Final -- mirrors the SIVEP form's own
+    Período fields, generalized across a possibly multi-year interval: Semana
+    Inicial bounds the first year, Semana Final bounds the last year (both
+    apply together when Ano inicial == Ano final, exactly like the site)."""
+
+    def __init__(self, title="Período (Ano + Semana Epidemiológica)"):
+        super().__init__(title)
+        cur_year = int(sivep_core._current_epi_week()[0])
+        years = [str(y) for y in range(cur_year, 2008, -1)]  # current -> 2009
+
+        outer = QVBoxLayout(self)
+
+        year_row = QHBoxLayout()
+        year_row.addWidget(QLabel("Ano inicial:"))
+        self.cmb_start_year = QComboBox()
+        self.cmb_start_year.addItems(years)
+        year_row.addWidget(self.cmb_start_year)
+        year_row.addSpacing(20)
+        year_row.addWidget(QLabel("Ano final:"))
+        self.cmb_end_year = QComboBox()
+        self.cmb_end_year.addItems(years)
+        year_row.addWidget(self.cmb_end_year)
+        year_row.addStretch()
+        outer.addLayout(year_row)
+
+        week_row = QHBoxLayout()
+        week_row.addWidget(QLabel("Semana Inicial:"))
+        self.spin_start_week = QSpinBox()
+        self.spin_start_week.setRange(1, 53)
+        week_row.addWidget(self.spin_start_week)
+        week_row.addSpacing(20)
+        week_row.addWidget(QLabel("Semana Final:"))
+        self.spin_end_week = QSpinBox()
+        self.spin_end_week.setRange(1, 53)
+        week_row.addWidget(self.spin_end_week)
+        week_row.addStretch()
+        outer.addLayout(week_row)
+
+        # Default: current epi year, full range (semana 1 .. semana atual).
+        self.cmb_start_year.setCurrentText(str(cur_year))
+        self.cmb_end_year.setCurrentText(str(cur_year))
+        self.spin_start_week.setValue(1)
+        self.spin_end_week.setMaximum(_max_week_for_year(cur_year))
+        self.spin_end_week.setValue(_max_week_for_year(cur_year))
+
+        self.cmb_start_year.currentTextChanged.connect(self._sync_start_week_max)
+        self.cmb_end_year.currentTextChanged.connect(self._sync_end_week_max)
+
+    def _sync_start_week_max(self, text):
+        self.spin_start_week.setMaximum(_max_week_for_year(int(text)))
+
+    def _sync_end_week_max(self, text):
+        self.spin_end_week.setMaximum(_max_week_for_year(int(text)))
+
+    def values(self):
+        """Return (start_year, end_year, start_week, end_week) as ints.
+
+        Years are normalized so start_year <= end_year (weeks are passed as
+        entered; _faixa_periods() defensively swaps a reversed week pair)."""
+        start_year = int(self.cmb_start_year.currentText())
+        end_year = int(self.cmb_end_year.currentText())
+        if start_year > end_year:
+            start_year, end_year = end_year, start_year
+        return start_year, end_year, self.spin_start_week.value(), self.spin_end_week.value()
+
+
+# --------------------------------------------------------------------------- #
 # Faixa Etária tab — Distribuição dos vírus respiratórios por faixa etária.
 # --------------------------------------------------------------------------- #
 
@@ -462,25 +551,8 @@ class FaixaEtariaTab(QWidget):
         )
         layout.addWidget(info)
 
-        # Year interval: download every SE from each year in [inicial, final].
-        cur_year = int(sivep_core._current_epi_week()[0])
-        years = [str(y) for y in range(cur_year, 2008, -1)]  # current -> 2009
-        period_box = QGroupBox("Intervalo de anos (Semana Epidemiológica)")
-        period_l = QHBoxLayout(period_box)
-        period_l.addWidget(QLabel("Ano inicial:"))
-        self.cmb_start_year = QComboBox()
-        self.cmb_start_year.addItems(years)
-        period_l.addWidget(self.cmb_start_year)
-        period_l.addSpacing(20)
-        period_l.addWidget(QLabel("Ano final:"))
-        self.cmb_end_year = QComboBox()
-        self.cmb_end_year.addItems(years)
-        period_l.addWidget(self.cmb_end_year)
-        period_l.addStretch()
-        # Default both to the current epi year (downloads weeks 1..semana atual).
-        self.cmb_start_year.setCurrentText(str(cur_year))
-        self.cmb_end_year.setCurrentText(str(cur_year))
-        layout.addWidget(period_box)
+        self.period = PeriodSelector()
+        layout.addWidget(self.period)
 
         box = QGroupBox("Unidades (US)")
         box_l = QHBoxLayout(box)
@@ -528,18 +600,16 @@ class FaixaEtariaTab(QWidget):
             QMessageBox.warning(self, "Unidades", "Selecione ao menos uma unidade.")
             return
 
-        start_year = int(self.cmb_start_year.currentText())
-        end_year = int(self.cmb_end_year.currentText())
-        if start_year > end_year:
-            start_year, end_year = end_year, start_year
+        start_year, end_year, start_week, end_week = self.period.values()
 
         # Estimate the workload and confirm before a long multi-week run.
-        n_weeks = len(sivep_core._faixa_periods(start_year, end_year))
+        n_weeks = len(sivep_core._faixa_periods(start_year, end_year, start_week, end_week))
         n_total = n_weeks * len(units) * len(sivep_core.FAIXA_TIPOS_FICHA)
         resp = QMessageBox.question(
             self,
             "Confirmar download",
-            f"Período: {start_year}–{end_year} ({n_weeks} semana(s) epidemiológica(s)).\n"
+            f"Período: {start_year} se{start_week} – {end_year} se{end_week} "
+            f"({n_weeks} semana(s) epidemiológica(s)).\n"
             f"Unidades: {len(units)} · Fichas: {len(sivep_core.FAIXA_TIPOS_FICHA)} (SG, SRAG UTI).\n\n"
             f"Total estimado: {n_total} exportações Excel.\n"
             "Isso pode demorar bastante. Deseja continuar?",
@@ -556,6 +626,8 @@ class FaixaEtariaTab(QWidget):
             headless=self.chk_headless.isChecked(),
             start_year=start_year,
             end_year=end_year,
+            start_week=start_week,
+            end_week=end_week,
         )
         self._worker.message.connect(self.log.appendPlainText)
         self._worker.finished_ok.connect(self._done)
@@ -600,24 +672,8 @@ class ConsultasTab(QWidget):
         )
         layout.addWidget(info)
 
-        # Year interval: download every SE from each year in [inicial, final].
-        cur_year = int(sivep_core._current_epi_week()[0])
-        years = [str(y) for y in range(cur_year, 2008, -1)]  # current -> 2009
-        period_box = QGroupBox("Intervalo de anos (Semana Epidemiológica)")
-        period_l = QHBoxLayout(period_box)
-        period_l.addWidget(QLabel("Ano inicial:"))
-        self.cmb_start_year = QComboBox()
-        self.cmb_start_year.addItems(years)
-        period_l.addWidget(self.cmb_start_year)
-        period_l.addSpacing(20)
-        period_l.addWidget(QLabel("Ano final:"))
-        self.cmb_end_year = QComboBox()
-        self.cmb_end_year.addItems(years)
-        period_l.addWidget(self.cmb_end_year)
-        period_l.addStretch()
-        self.cmb_start_year.setCurrentText(str(cur_year))
-        self.cmb_end_year.setCurrentText(str(cur_year))
-        layout.addWidget(period_box)
+        self.period = PeriodSelector()
+        layout.addWidget(self.period)
 
         box = QGroupBox("Unidades (US)")
         box_l = QHBoxLayout(box)
@@ -664,18 +720,16 @@ class ConsultasTab(QWidget):
             QMessageBox.warning(self, "Unidades", "Selecione ao menos uma unidade.")
             return
 
-        start_year = int(self.cmb_start_year.currentText())
-        end_year = int(self.cmb_end_year.currentText())
-        if start_year > end_year:
-            start_year, end_year = end_year, start_year
+        start_year, end_year, start_week, end_week = self.period.values()
 
         # Estimate the workload and confirm before a long multi-week run.
-        n_weeks = len(sivep_core._faixa_periods(start_year, end_year))
+        n_weeks = len(sivep_core._faixa_periods(start_year, end_year, start_week, end_week))
         n_total = n_weeks * len(units)
         resp = QMessageBox.question(
             self,
             "Confirmar download",
-            f"Período: {start_year}–{end_year} ({n_weeks} semana(s) epidemiológica(s)).\n"
+            f"Período: {start_year} se{start_week} – {end_year} se{end_week} "
+            f"({n_weeks} semana(s) epidemiológica(s)).\n"
             f"Unidades: {len(units)} · Ficha: Atendimentos por SG.\n\n"
             f"Total estimado: {n_total} exportações Excel.\n"
             "Isso pode demorar bastante. Deseja continuar?",
@@ -692,6 +746,8 @@ class ConsultasTab(QWidget):
             headless=self.chk_headless.isChecked(),
             start_year=start_year,
             end_year=end_year,
+            start_week=start_week,
+            end_week=end_week,
         )
         self._worker.message.connect(self.log.appendPlainText)
         self._worker.finished_ok.connect(self._done)
